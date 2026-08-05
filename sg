@@ -1,0 +1,49 @@
+#!/bin/sh
+
+set -e
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")" && pwd)
+
+python_supports_repo() {
+    candidate=$1
+    [ -x "$candidate" ] || return 1
+    "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
+}
+
+resolve_python_bin() {
+    if [ -n "$SG_PYTHON" ] && python_supports_repo "$SG_PYTHON"; then
+        printf '%s\n' "$SG_PYTHON"
+        return 0
+    fi
+
+    for candidate in \
+        /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
+        /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
+        /Library/Frameworks/Python.framework/Versions/3.11/bin/python3
+    do
+        if python_supports_repo "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    if command -v python3 >/dev/null 2>&1; then
+        candidate=$(command -v python3)
+        if python_supports_repo "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    if python_supports_repo /usr/bin/python3; then
+        printf '%s\n' /usr/bin/python3
+        return 0
+    fi
+
+    echo "ERROR: Could not find a supported python3 interpreter. Set SG_PYTHON or install Python 3.11+." >&2
+    exit 127
+}
+
+PYTHON_BIN=$(resolve_python_bin)
+
+SG_PROG_NAME=sg exec "$PYTHON_BIN" "$SCRIPT_DIR/sg.py" "$@"

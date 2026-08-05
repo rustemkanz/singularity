@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "singularity-sg"
+version = "0.1.0"
+description = "Local, approval-aware delivery workflow CLI for human-guided, agent-assisted delivery across Azure DevOps and GitLab."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Rustem Kanzafarov" }]
+keywords = ["cli", "azure-devops", "gitlab", "devops", "workflow", "code-review", "ai-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control",
+]
+# Runtime uses only the Python standard library. `certifi` is an optional
+# convenience for environments whose default trust store cannot verify TLS.
+dependencies = []
+
+[project.optional-dependencies]
+tls = ["certifi"]
+
+[project.urls]
+Homepage = "https://github.com/rustemkanz/singularity"
+Repository = "https://github.com/rustemkanz/singularity"
+Changelog = "https://github.com/rustemkanz/singularity/blob/main/CHANGELOG.md"
+
+[project.scripts]
+sg = "sg:main"
+
+[tool.setuptools]
+py-modules = ["sg", "app_config", "errors", "git_client", "workflow_models"]
+packages = ["cli_commands", "providers", "providers.azure_devops", "providers.gitlab"]

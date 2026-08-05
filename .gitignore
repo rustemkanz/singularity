@@ -1,0 +1,5 @@
+.ado-artifacts/
+.sg-artifacts/
+__pycache__/
+.env
+.env.local
