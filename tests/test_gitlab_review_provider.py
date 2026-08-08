@@ -37,6 +37,7 @@ class GitLabReviewProviderTests(unittest.TestCase):
         merge_request = {
             "iid": 7,
             "project_id": 99,
+            "sha": "a" * 40,
             "title": "Improve pipeline rules",
             "state": "opened",
             "source_branch": "feature/rules",
@@ -293,8 +294,12 @@ class GitLabReviewProviderTests(unittest.TestCase):
             "path_with_namespace": "group/project",
             "default_branch": "main",
         }
+        branch = {
+            "name": "feature/rules",
+            "commit": {"id": "a" * 40},
+        }
 
-        with mock.patch.object(provider, "_request_json", return_value=project) as request_json:
+        with mock.patch.object(provider, "_request_json", side_effect=[project, branch]) as request_json:
             with mock.patch("providers.gitlab.review_provider.current_git_branch", return_value="feature/rules"):
                 repository, payload = provider.prepare_change_request(
                     work_item_id=17,
@@ -309,15 +314,30 @@ class GitLabReviewProviderTests(unittest.TestCase):
         self.assertEqual(repository.id, "99")
         self.assertEqual(repository.project, "group/project")
         self.assertEqual(payload, {
-            "title": "[17] Improve pipeline rules",
-            "description": "Closes #17",
-            "source_branch": "feature/rules",
-            "target_branch": "main",
-            "remove_source_branch": True,
+            "request": {
+                "method": "POST",
+                "formData": {
+                    "title": "[17] Improve pipeline rules",
+                    "description": "Closes #17",
+                    "source_branch": "feature/rules",
+                    "target_branch": "main",
+                    "remove_source_branch": True,
+                },
+            },
+            "sourceRef": {
+                "name": "feature/rules",
+                "commitId": "a" * 40,
+            },
         })
-        request_json.assert_called_once_with(
+        self.assertEqual(request_json.call_count, 2)
+        request_json.assert_any_call(
             "https://gitlab.com",
             "/projects/group%2Fproject",
+            allow_not_found=True,
+        )
+        request_json.assert_any_call(
+            "https://gitlab.com",
+            "/projects/99/repository/branches/feature%2Frules",
             allow_not_found=True,
         )
 
@@ -332,6 +352,7 @@ class GitLabReviewProviderTests(unittest.TestCase):
         merge_request = {
             "iid": 7,
             "project_id": 99,
+            "sha": "a" * 40,
             "title": "[17] Improve pipeline rules",
             "state": "opened",
             "source_branch": "feature/rules",
@@ -339,8 +360,16 @@ class GitLabReviewProviderTests(unittest.TestCase):
             "author": {"username": "alice"},
             "web_url": "https://gitlab.com/group/project/-/merge_requests/7",
         }
+        branch = {
+            "name": "feature/rules",
+            "commit": {"id": "a" * 40},
+        }
 
-        with mock.patch.object(provider, "_request_json", side_effect=[project, merge_request]) as request_json:
+        with mock.patch.object(
+            provider,
+            "_request_json",
+            side_effect=[project, branch, branch, merge_request],
+        ) as request_json:
             with mock.patch("providers.gitlab.review_provider.current_git_branch", return_value="feature/rules"):
                 change_request = provider.create_change_request(
                     work_item_id=17,
@@ -355,18 +384,95 @@ class GitLabReviewProviderTests(unittest.TestCase):
         self.assertEqual(change_request.id, 7)
         self.assertEqual(change_request.repo_id, "99")
         self.assertEqual(change_request.provider, "gitlab")
-        self.assertEqual(request_json.call_args_list[1].args[:2], (
+        self.assertEqual(request_json.call_args_list[3].args[:2], (
             "https://gitlab.com",
             "/projects/99/merge_requests",
         ))
-        self.assertEqual(request_json.call_args_list[1].kwargs["method"], "POST")
-        self.assertEqual(request_json.call_args_list[1].kwargs["form_data"], {
+        self.assertEqual(request_json.call_args_list[3].kwargs["method"], "POST")
+        self.assertEqual(request_json.call_args_list[3].kwargs["form_data"], {
             "title": "[17] Improve pipeline rules",
             "description": "Closes #17",
             "source_branch": "feature/rules",
             "target_branch": "main",
             "remove_source_branch": True,
         })
+
+    def test_create_prepared_change_request_rejects_moved_source_branch(self):
+        provider = GitLabReviewProvider("token")
+        repository = RepositoryRef(
+            id="99",
+            name="project",
+            project="group/project",
+        )
+        prepared = {
+            "request": {
+                "method": "POST",
+                "formData": {
+                    "title": "[17] Improve pipeline rules",
+                    "source_branch": "feature/rules",
+                    "target_branch": "main",
+                },
+            },
+            "sourceRef": {
+                "name": "feature/rules",
+                "commitId": "a" * 40,
+            },
+        }
+        moved_branch = {
+            "name": "feature/rules",
+            "commit": {"id": "b" * 40},
+        }
+
+        with mock.patch.object(provider, "_request_json", return_value=moved_branch) as request_json:
+            with self.assertRaisesRegex(CliError, "moved after preview"):
+                provider.create_prepared_change_request(repository, prepared)
+
+        request_json.assert_called_once_with(
+            "https://gitlab.com",
+            "/projects/99/repository/branches/feature%2Frules",
+            allow_not_found=True,
+        )
+
+    def test_create_prepared_change_request_reports_created_mr_with_unapproved_source_tip(self):
+        provider = GitLabReviewProvider("token")
+        repository = RepositoryRef(
+            id="99",
+            name="project",
+            project="group/project",
+        )
+        prepared = {
+            "request": {
+                "method": "POST",
+                "formData": {
+                    "title": "[17] Improve pipeline rules",
+                    "source_branch": "feature/rules",
+                    "target_branch": "main",
+                },
+            },
+            "sourceRef": {
+                "name": "feature/rules",
+                "commitId": "a" * 40,
+            },
+        }
+        branch = {
+            "name": "feature/rules",
+            "commit": {"id": "a" * 40},
+        }
+        created = {
+            "iid": 7,
+            "sha": "b" * 40,
+        }
+
+        with mock.patch.object(
+            provider,
+            "_request_json",
+            side_effect=[branch, created],
+        ):
+            with self.assertRaisesRegex(
+                CliError,
+                "created merge request 7.*Do not retry",
+            ):
+                provider.create_prepared_change_request(repository, prepared)
 
     def test_prepare_review_comment_builds_gitlab_payload(self):
         provider = GitLabReviewProvider("token")

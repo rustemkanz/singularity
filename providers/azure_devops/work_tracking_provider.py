@@ -1,5 +1,7 @@
 import urllib.parse
+import copy
 
+from errors import CliError
 from providers.azure_devops.work_item_context import build_work_item_comments, build_work_item_context
 from app_config import BASE_URL, ORG, PROJECT
 from providers.azure_devops.http import api
@@ -14,7 +16,13 @@ from providers.azure_devops.work_items import (
     sprint_required,
     suggest_start_work_plan,
 )
-from providers.interfaces import TeamRef, WorkItemCommentsSnapshot, WorkItemContextSnapshot, WorkTrackingProvider
+from providers.interfaces import (
+    TeamRef,
+    WorkItemCommentsSnapshot,
+    WorkItemContextSnapshot,
+    WorkItemTransitionPreview,
+    WorkTrackingProvider,
+)
 from workflow_models import (
     CandidateWorkItem,
     Sprint,
@@ -206,13 +214,72 @@ class AzureDevOpsWorkTrackingProvider(WorkTrackingProvider):
         )
         return _deserialize_start_work_plan(suggest_start_work_plan(item))
 
-    def transition_work_item(self, *, item_id: int, state: str, assignee: str | None = None) -> str:
-        resolved_state = resolve_transition_state_name(self.token, item_id=item_id, desired_state=state)
-        operations = [{"op": "replace", "path": "/fields/System.State", "value": resolved_state}]
+    def prepare_work_item_transition(
+        self,
+        *,
+        item_id: int,
+        state: str,
+        assignee: str | None = None,
+    ) -> WorkItemTransitionPreview:
+        work_item = fetch_work_item(
+            self.token,
+            item_id,
+            fields=["System.WorkItemType", "System.State"],
+        )
+        revision = work_item.get("rev")
+        if not isinstance(revision, int) or isinstance(revision, bool):
+            raise CliError(
+                f"ERROR: Work item {item_id} did not include a valid revision; "
+                "refusing to prepare an unguarded transition."
+            )
+        fields = work_item.get("fields") or {}
+        resolved_state = resolve_transition_state_name(
+            self.token,
+            item_id=item_id,
+            desired_state=state,
+            work_item=work_item,
+        )
+        operations = [
+            {"op": "test", "path": "/rev", "value": revision},
+            {"op": "replace", "path": "/fields/System.State", "value": resolved_state},
+        ]
         if assignee is not None:
             operations.append({"op": "replace", "path": "/fields/System.AssignedTo", "value": assignee})
-        patch_item(self.token, item_id, operations)
-        return resolved_state
+        return WorkItemTransitionPreview(
+            provider="azure-devops",
+            item_id=item_id,
+            requested_state=state,
+            concrete_state=resolved_state,
+            current_snapshot={
+                "state": fields.get("System.State"),
+                "revision": revision,
+            },
+            request={
+                "method": "PATCH",
+                "operations": operations,
+            },
+        )
+
+    def apply_prepared_work_item_transition(self, preview: WorkItemTransitionPreview) -> str:
+        if preview.provider != "azure-devops":
+            raise CliError(
+                f"ERROR: Cannot apply a {preview.provider!r} transition with the Azure DevOps provider."
+            )
+        if preview.request.get("method") != "PATCH":
+            raise CliError("ERROR: Prepared Azure DevOps transition does not contain a PATCH request.")
+        operations = preview.request.get("operations")
+        if not isinstance(operations, list):
+            raise CliError("ERROR: Prepared Azure DevOps transition does not contain JSON Patch operations.")
+        patch_item(self.token, preview.item_id, copy.deepcopy(operations))
+        return preview.concrete_state
+
+    def transition_work_item(self, *, item_id: int, state: str, assignee: str | None = None) -> str:
+        preview = self.prepare_work_item_transition(
+            item_id=item_id,
+            state=state,
+            assignee=assignee,
+        )
+        return self.apply_prepared_work_item_transition(preview)
 
     def get_triage_report(self, *, item_ids: list[int]) -> TriageReport:
         fields = fetch_items(

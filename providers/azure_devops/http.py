@@ -50,6 +50,8 @@ def api_with_headers(
             _ = e.read().decode()
             return None, dict(e.headers.items())
         _raise_http_error(e)
+    except urllib.error.URLError as e:
+        raise CliError(f"ERROR: Azure DevOps API request failed: {e.reason}") from e
 
 
 def api_text_with_headers(
@@ -85,6 +87,8 @@ def api_text_with_headers(
             _ = e.read().decode()
             return None, dict(e.headers.items())
         _raise_http_error(e)
+    except urllib.error.URLError as e:
+        raise CliError(f"ERROR: Azure DevOps API request failed: {e.reason}") from e
 
 
 def api(token: str, method: str, url: str, body=None, *, content_type: str | None = None) -> dict:

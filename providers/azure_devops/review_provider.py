@@ -27,8 +27,6 @@ from providers.azure_devops.pull_requests import (
     resolve_pull_request,
     serialize_pr_status,
     thread_status_name,
-    update_pr_comment_text,
-    update_pr_thread_status,
 )
 from providers.azure_devops.work_items import fetch_work_item_title
 from providers.azure_devops.work_item_context import list_repositories
@@ -113,6 +111,24 @@ class AzureDevOpsReviewProvider(ReviewProvider):
             "ERROR: Multiple repositories found. Pass --repo with repo name or repo id, "
             "or set AZURE_DEVOPS_DEFAULT_REPO."
         )
+
+    def _fetch_source_ref_tip(self, repository: RepositoryRef, source_ref_name: str) -> str:
+        if repository.id is None:
+            raise CliError("ERROR: Repository id is required to resolve a source branch.")
+        filter_value = source_ref_name[len("refs/"):] if source_ref_name.startswith("refs/") else source_ref_name
+        query = urllib.parse.urlencode({"filter": filter_value, "api-version": API_VER})
+        url = (
+            f"https://dev.azure.com/{ORG}/{urllib.parse.quote(PROJECT)}/_apis/git/repositories/"
+            f"{urllib.parse.quote(repository.id, safe='')}/refs?{query}"
+        )
+        refs = api(self.token, "GET", url).get("value") or []
+        matching_refs = [ref for ref in refs if ref.get("name") == source_ref_name]
+        if len(matching_refs) != 1 or not matching_refs[0].get("objectId"):
+            raise CliError(
+                f"ERROR: Azure DevOps source branch '{source_ref_name}' was not found in "
+                f"repository '{repository.name}'."
+            )
+        return matching_refs[0]["objectId"]
 
     def resolve_review_context(
         self,
@@ -287,22 +303,33 @@ class AzureDevOpsReviewProvider(ReviewProvider):
         source = source_branch or current_git_branch() or ""
         if source.startswith("refs/heads/"):
             source = source[len("refs/heads/"):]
+        if not source or source == "HEAD":
+            raise CliError("ERROR: Could not resolve a source branch for Azure DevOps pull-request creation.")
         target = target_branch or "main"
         resolved_title = title
         if not resolved_title:
             resolved_work_item_title = work_item_title or fetch_work_item_title(self.token, work_item_id)
             resolved_title = f"[{work_item_id}] {resolved_work_item_title}"
-        payload = {
+        request_body = {
             "title": resolved_title,
             "description": description or f"Closes #{work_item_id}",
             "sourceRefName": f"refs/heads/{source}",
             "targetRefName": f"refs/heads/{target}",
             "workItemRefs": [{"id": str(work_item_id)}],
         }
-        return (
-            RepositoryRef(id=repo.get("id"), name=repo.get("name") or "?", project=PROJECT),
-            payload,
-        )
+        repository = RepositoryRef(id=repo.get("id"), name=repo.get("name") or "?", project=PROJECT)
+        source_ref_name = request_body["sourceRefName"]
+        source_commit_id = self._fetch_source_ref_tip(repository, source_ref_name)
+        return repository, {
+            "request": {
+                "method": "POST",
+                "body": request_body,
+            },
+            "sourceRef": {
+                "name": source_ref_name,
+                "commitId": source_commit_id,
+            },
+        }
 
     def create_change_request(
         self,
@@ -324,13 +351,48 @@ class AzureDevOpsReviewProvider(ReviewProvider):
             description=description,
             work_item_title=work_item_title,
         )
+        return self.create_prepared_change_request(repository, payload)
+
+    def create_prepared_change_request(
+        self,
+        repository: RepositoryRef,
+        payload: dict,
+    ) -> ChangeRequest:
         if repository.id is None:
             raise CliError("ERROR: Repository id is required to create a change request.")
+        request = payload.get("request") or {}
+        source_ref = payload.get("sourceRef") or {}
+        request_body = request.get("body")
+        source_ref_name = source_ref.get("name")
+        expected_commit_id = source_ref.get("commitId")
+        if request.get("method") != "POST" or not isinstance(request_body, dict):
+            raise CliError("ERROR: Prepared Azure DevOps change request does not contain an exact POST body.")
+        if (
+            not isinstance(source_ref_name, str)
+            or not isinstance(expected_commit_id, str)
+            or request_body.get("sourceRefName") != source_ref_name
+        ):
+            raise CliError("ERROR: Prepared Azure DevOps change request has an invalid source-ref precondition.")
+        current_commit_id = self._fetch_source_ref_tip(repository, source_ref_name)
+        if current_commit_id != expected_commit_id:
+            raise CliError(
+                f"ERROR: Azure DevOps source branch '{source_ref_name}' moved after preview; "
+                "generate and approve a fresh plan."
+            )
         url = (
             f"https://dev.azure.com/{ORG}/{urllib.parse.quote(PROJECT)}/_apis/git/repositories/{repository.id}/pullrequests"
             f"?api-version={API_VER}"
         )
-        result = api(self.token, "POST", url, payload)
+        result = api(self.token, "POST", url, request_body)
+        created_commit_id = (result.get("lastMergeSourceCommit") or {}).get("commitId")
+        if created_commit_id != expected_commit_id:
+            pull_request_id = result.get("pullRequestId", "?")
+            observed = created_commit_id or "not returned by Azure DevOps"
+            raise CliError(
+                f"ERROR: Azure DevOps created pull request {pull_request_id}, but its source commit "
+                f"is {observed} instead of approved commit {expected_commit_id}. Do not retry; "
+                "inspect the created pull request and source branch first."
+            )
         return build_change_request(
             {"id": repository.id, "name": repository.name},
             result,
@@ -352,12 +414,20 @@ class AzureDevOpsReviewProvider(ReviewProvider):
         *,
         text: str,
     ) -> ReviewMutationResult:
+        preview = self.prepare_review_comment(context, text=text)
+        return self.create_prepared_review_comment(context, preview)
+
+    def create_prepared_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
         repo_id, pr_id = self._require_context_ids(context)
         result = create_pr_thread(
             self.token,
             {"id": repo_id, "name": context.repository.name},
             {"pullRequestId": pr_id},
-            build_pr_thread_payload(text),
+            preview.payload,
             project_name=context.project,
             org_name=context.organization,
         )
@@ -411,7 +481,6 @@ class AzureDevOpsReviewProvider(ReviewProvider):
         start_offset: int,
         end_offset: int | None,
     ) -> ReviewMutationResult:
-        repo_id, pr_id = self._require_context_ids(context)
         preview = self.prepare_inline_review_comment(
             context,
             text=text,
@@ -421,6 +490,14 @@ class AzureDevOpsReviewProvider(ReviewProvider):
             start_offset=start_offset,
             end_offset=end_offset,
         )
+        return self.create_prepared_inline_review_comment(context, preview)
+
+    def create_prepared_inline_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
+        repo_id, pr_id = self._require_context_ids(context)
         result = create_pr_thread(
             self.token,
             {"id": repo_id, "name": context.repository.name},
@@ -464,13 +541,22 @@ class AzureDevOpsReviewProvider(ReviewProvider):
         text: str,
         parent_comment_id: int | None,
     ) -> ReviewMutationResult:
-        repo_id, pr_id = self._require_context_ids(context)
         preview = self.prepare_review_reply(
             context,
             thread_id=thread_id,
             text=text,
             parent_comment_id=parent_comment_id,
         )
+        return self.create_prepared_review_reply(context, preview)
+
+    def create_prepared_review_reply(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
+        repo_id, pr_id = self._require_context_ids(context)
+        if preview.thread_id is None:
+            raise CliError("ERROR: Prepared review reply is missing a thread id.")
         result = api(
             self.token,
             "POST",
@@ -530,35 +616,34 @@ class AzureDevOpsReviewProvider(ReviewProvider):
         comment_id: int,
         text: str,
     ) -> ReviewMutationResult:
+        preview = self.prepare_review_comment_edit(
+            context,
+            thread_id=thread_id,
+            comment_id=comment_id,
+            text=text,
+        )
+        return self.edit_prepared_review_comment(context, preview)
+
+    def edit_prepared_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
         repo_id, pr_id = self._require_context_ids(context)
-        thread = fetch_pr_thread(
+        if preview.thread_id is None or preview.comment_id is None:
+            raise CliError("ERROR: Prepared comment edit is missing thread or comment identity.")
+        result = api(
             self.token,
-            repo_id,
-            pr_id,
-            thread_id,
-            project_name=context.project,
-            org_name=context.organization,
+            "PATCH",
+            (
+                f"https://dev.azure.com/{context.organization}/{urllib.parse.quote(context.project)}/_apis/git/repositories/"
+                f"{repo_id}/pullrequests/{pr_id}/threads/{preview.thread_id}/comments/{preview.comment_id}"
+                f"?api-version={API_VER}"
+            ),
+            preview.payload,
+            content_type="application/json",
         )
-        comment = fetch_pr_comment(
-            self.token,
-            repo_id,
-            pr_id,
-            thread_id,
-            comment_id,
-            project_name=context.project,
-            org_name=context.organization,
-        )
-        result = update_pr_comment_text(
-            self.token,
-            self._context_repo(context),
-            {"pullRequestId": pr_id},
-            thread,
-            comment,
-            text,
-            project_name=context.project,
-            org_name=context.organization,
-        )
-        return ReviewMutationResult(thread_id=thread.get("id"), comment_id=result.get("id"))
+        return ReviewMutationResult(thread_id=preview.thread_id, comment_id=result.get("id"))
 
     def prepare_review_thread_resolution(
         self,
@@ -589,22 +674,29 @@ class AzureDevOpsReviewProvider(ReviewProvider):
         thread_id: int,
         status: str,
     ) -> ReviewMutationResult:
+        preview = self.prepare_review_thread_resolution(
+            context,
+            thread_id=thread_id,
+            status=status,
+        )
+        return self.resolve_prepared_review_thread(context, preview)
+
+    def resolve_prepared_review_thread(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
         repo_id, pr_id = self._require_context_ids(context)
-        thread = fetch_pr_thread(
+        if preview.thread_id is None:
+            raise CliError("ERROR: Prepared thread resolution is missing a thread id.")
+        result = api(
             self.token,
-            repo_id,
-            pr_id,
-            thread_id,
-            project_name=context.project,
-            org_name=context.organization,
+            "PATCH",
+            (
+                f"https://dev.azure.com/{context.organization}/{urllib.parse.quote(context.project)}/_apis/git/repositories/"
+                f"{repo_id}/pullrequests/{pr_id}/threads/{preview.thread_id}?api-version={API_VER}"
+            ),
+            preview.payload,
+            content_type="application/json",
         )
-        result = update_pr_thread_status(
-            self.token,
-            self._context_repo(context),
-            {"pullRequestId": pr_id},
-            thread,
-            status,
-            project_name=context.project,
-            org_name=context.organization,
-        )
-        return ReviewMutationResult(thread_id=thread.get("id"), status=thread_status_name(result))
+        return ReviewMutationResult(thread_id=preview.thread_id, status=thread_status_name(result))

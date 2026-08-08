@@ -35,6 +35,12 @@ export AZURE_DEVOPS_USER="you@example.com"
 export AZURE_DEVOPS_QA_USER="qa@example.com"
 ```
 
+Off-origin work-item media is blocked by default. Trust a required CDN only by exact public HTTPS origin:
+
+```bash
+export AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS="https://media.example.com"
+```
+
 Optional fallback when you are not running inside the target work repo:
 ```bash
 export AZURE_DEVOPS_DEFAULT_REPO="your-repo-name"
@@ -62,13 +68,13 @@ If these variables are not set, `sg.py` falls back to neutral placeholder values
 ./sg attachments <id> --open
 ./sg introduced-by <id>
 ./sg triage <id1> <id2> <id3>
-./sg start-work <id>
 ./sg start <id>
-./sg start <id> --apply
+./sg start <id> --json
+./sg start <id> --apply <PLAN_ID>
 ./sg create-pr <id> --repo <repo-name-or-id> --source <branch>
-./sg create-pr <id> --repo <repo-name-or-id> --source <branch> --apply
+./sg create-pr <id> --repo <repo-name-or-id> --source <branch> --apply <PLAN_ID>
 ./sg review <id>
-./sg review <id> --apply
+./sg review <id> --apply <PLAN_ID>
 ./sg pr-analyze --url <ado-pr-url>
 ./sg pr-analyze --url <ado-pr-url> --json
 ./sg pr-statuses --url <ado-pr-url>
@@ -78,28 +84,30 @@ If these variables are not set, `sg.py` falls back to neutral placeholder values
 ./sg pr-diff --url <ado-pr-url> --path <repo-path>
 ./sg pr-comments --url <ado-pr-url> --unresolved-only
 ./sg pr-comments --url <ado-pr-url> --json
-./sg pr-inline-comment --url <ado-pr-url> --path <repo-path> --line <line> --dry-run "Please clarify this branch logic."
+./sg pr-inline-comment --url <ado-pr-url> --path <repo-path> --line <line> "Please clarify this branch logic."
 ./sg pr-reply --url <ado-pr-url> --thread <thread-id> "Thanks, I will adjust this."
-./sg pr-edit-comment --thread <thread-id> --comment <comment-id> "Updated reviewer response. AI-assisted via Copilot."
+./sg pr-edit-comment --url <ado-pr-url> --thread <thread-id> --comment <comment-id> "Updated reviewer response. AI-assisted via Copilot."
 ./sg pr-resolve --url <ado-pr-url> --thread <thread-id>
 ./sg pr-review-draft --url <ado-pr-url> --output review-draft.json
-./sg pr-review-apply review-draft.json --dry-run
+./sg pr-review-apply review-draft.json --entry <index>
 ./sg builds --definition <pipeline-id> --project <ado-project>
 ./sg builds --definition <pipeline-id> --project <ado-project> --latest-for-branch main
 ./sg builds --definition <pipeline-id> --project <ado-project> --commit <sha>
-./sg build-status <build-id> --project <ado-project> --watch --approve
 ./sg build-status <build-id> --project <ado-project> --watch --verbose
 ./sg build-status <build-id> --project <ado-project> --stage "Deploy" --only-failed --show-log-ids
+./sg build-approvals <build-id> --project <ado-project>
+./sg approve-gate <build-id> --project <ado-project> --approval <approval-id>
+./sg queue-build --definition <pipeline-id> --project <ado-project> --branch <branch> --commit <commit-ref>
 ./sg build-logs <build-id> --project <ado-project> --failed
-
-`builds` now surfaces the Azure DevOps build reason, and supports latest-branch or commit filtering for duplicate-run triage. `queue-build` warns when recent builds already exist for the current local branch and commit. `build-status` shows grouped stage state, includes concise failure-tail lines for failed steps, can emit task log ids, can filter by stage or active or failed state, and prints only changed lines while watching unless you opt into `--verbose`. Pending stages now include a concise reason such as approval wait, task wait, job wait, or a generic upstream or capacity explanation. Use `build-logs` when you need the full matching log output.
 ./sg handoff-to-qa <id>
 ./sg doctor
 ./sg comment <id> "Need clarification on ..."
-./sg comment <id> "Need clarification on ..." --apply
+./sg comment <id> "Need clarification on ..." --apply <PLAN_ID>
 ```
 
-`comment`, `start`, `create-pr`, `prepare-review`, and `review` print an exact plan by default. Inspect that output and add `--apply` only after the user explicitly approves that individual external action. `--dry-run` remains accepted as a compatibility form for PR previews.
+`builds` surfaces the Azure DevOps build reason and supports latest-branch or commit filtering for duplicate-run triage. `queue-build` resolves its commit reference to a full SHA before previewing and binds that `sourceVersion` plus the recent matching-build snapshot into the plan. Existing matching runs block queueing unless `--allow-duplicate` is included in the separately reviewed preview and approved apply. `build-status` is read-only, groups stage state, includes concise failure-tail lines, and prints only changed lines while watching unless `--verbose` is set. Use `build-approvals` to inspect pending gates and `approve-gate` for a separately approved gate mutation.
+
+Every external mutator prints an exact plan and full `sha256:` Plan ID by default. Inspect that output, obtain explicit approval for that individual action, and rerun the otherwise unchanged command with `--apply <PLAN_ID>`. If any target, payload, or provider-derived value changes, the ID is rejected and the new plan needs fresh approval. After a timeout or ambiguous response, inspect provider state before previewing a retry. `--dry-run` remains accepted as a compatibility form where it existed previously.
 
 ---
 
@@ -195,7 +203,7 @@ If screenshots, mockups, or pasted UI context may matter, also fetch the work it
 ./sg attachments <id>
 ```
 
-This downloads image evidence by default into `./.sg-artifacts/work-item-<id>/` so the local implementation context includes the same screenshots visible in Azure DevOps. Use `--no-download` to inspect references only or `--images-only` to limit output to screenshot-like media.
+This downloads image evidence by default into `./.sg-artifacts/work-item-<id>/` so the local implementation context includes the same screenshots visible in Azure DevOps. Azure-hosted media is authenticated only inside the configured organization scope. Off-origin media is denied unless its exact public HTTPS origin appears in `AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS`; redirects and DNS destinations are revalidated. Use `--no-download` to inspect references only or `--images-only` to limit output to screenshot-like media.
 
 Use `--download-all` when you also want non-image attachments, and `--open` to reveal the download directory in the local file browser after download.
 
@@ -226,14 +234,14 @@ When the helper itself is failing due to auth, repo selection, or project mismat
 The CLI form is:
 
 ```bash
-./sg start-work <id>
 ./sg start <id>
+./sg start <id> --json
 ./sg pick-next --start
 ```
 
-`start-work`, `start`, and `pick-next --start` obtain the same provider-generated `StartWorkPlan`, so the default branch and PR metadata have one source of truth. `start-work` is the plan-only form: it supports `--json`, has no `--apply`, and never changes ADO. `start` adds the action boundary: it shows the item context and plan, remains read-only by default, and moves the item to `In Progress` only with `--apply`. An explicit `--branch` overrides the rendered branch plan. Bugs default to `fix/<id>-...`; other types use the provider's canonical prefix.
+`start` is the single source for the provider-generated `StartWorkPlan`, so branch, PR metadata, and the `In Progress` transition cannot diverge between commands. It remains read-only by default, supports `--json`, and moves the item only with its exact approved Plan ID. An explicit `--branch` overrides the rendered branch plan. Bugs default to `fix/<id>-...`; other types use the provider's canonical prefix.
 
-Neither command creates the local branch. After approving and applying the transition, create the exact displayed branch in the verified target checkout. `pick-next --start --apply` uses the same action path for the selected item.
+`start` does not create the local branch. After approving and applying the transition, create the exact displayed branch in the verified target checkout. `pick-next --start --apply <PLAN_ID>` uses the same action path for the selected item.
 
 If you want a quick regression-origin signal before archaeology in git, use:
 
@@ -251,7 +259,7 @@ If you are triaging several bugs and want grouping hints for review-friendly PRs
 
 ```bash
 ITEM_ID=<work-item-id>
-BRANCH_NAME="<exact-branch-from-start-work-plan>"
+BRANCH_NAME="<exact-branch-from-start-plan>"
 
 git checkout main && git pull
 git checkout -b "$BRANCH_NAME"
@@ -274,12 +282,12 @@ The CLI form is:
 
 ```bash
 ./sg create-pr <id> --repo <repo-name-or-id> --source <branch>
-./sg create-pr <id> --repo <repo-name-or-id> --source <branch> --apply
+./sg create-pr <id> --repo <repo-name-or-id> --source <branch> --apply <PLAN_ID>
 ./sg review <id>
-./sg review <id> --apply
+./sg review <id> --apply <PLAN_ID>
 ```
 
-The first `create-pr` invocation previews the exact PR payload. Create it with `--apply` only after explicit approval. Preview and approve the separate work-item review transition independently; PR creation approval does not authorize `review --apply`.
+The first `create-pr` invocation previews the exact PR payload. Create it only with that plan's approved ID. Preview and approve the separate work-item review transition independently; PR creation approval does not authorize `review`. There is deliberately no composite PR-plus-transition mutation.
 
 ### 6a. Push branch and open a PR
 
@@ -331,16 +339,18 @@ Review existing comments and prepare new ones:
 
 ```bash
 ./sg pr-comments --url <ado-pr-url> --unresolved-only
-./sg pr-inline-comment --url <ado-pr-url> --path <repo-path> --line <line> --dry-run "Please clarify this branch logic."
-./sg pr-comment --url <ado-pr-url> --dry-run "High-level feedback before approval."
+./sg pr-inline-comment --url <ado-pr-url> --path <repo-path> --line <line> "Please clarify this branch logic."
+./sg pr-comment --url <ado-pr-url> "High-level feedback before approval."
 ```
 
-Draft a review bundle for later approval or replay:
+Draft a review bundle for later per-entry approval and application:
 
 ```bash
 ./sg pr-review-draft --url <ado-pr-url> --output review-draft.json
-./sg pr-review-apply review-draft.json --dry-run
+./sg pr-review-apply review-draft.json --entry <index>
 ```
+
+Each mutation command above previews by default. Apply an individually approved review action by rerunning the same command with its displayed `--apply <PLAN_ID>`. A review draft with multiple entries requires `--entry <INDEX>` so every posted comment, edit, reply, or resolution receives its own preview and approval; a single-entry draft may omit `--entry`.
 
 When drafting reviewer replies for user approval in chat, label each section with a quoted excerpt of the reviewer comment instead of only the numeric thread id. Example:
 
@@ -366,9 +376,10 @@ Once the PR has no blocking comments and is approved:
 
 ```bash
 ./sg handoff-to-qa <id>
+./sg handoff-to-qa <id> --apply <PLAN_ID>
 ```
 
-This uses the configured `AZURE_DEVOPS_QA_USER` value unless overridden with `--qa`.
+The first invocation previews the transition and assignee. The approved invocation uses the configured `AZURE_DEVOPS_QA_USER` value unless overridden with `--qa`.
 
 The raw REST form is:
 

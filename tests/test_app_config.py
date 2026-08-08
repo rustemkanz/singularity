@@ -51,6 +51,37 @@ class AppConfigTests(unittest.TestCase):
 
         self.assertIsNone(value)
 
+    def test_parse_https_origins_normalizes_exact_origins_and_removes_duplicates(self):
+        origins = app_config.parse_https_origins(
+            " https://Media.Example.com:443/,https://cdn.example.com:8443,"
+            "https://media.example.com "
+        )
+
+        self.assertEqual(
+            origins,
+            ("https://media.example.com", "https://cdn.example.com:8443"),
+        )
+
+    def test_normalize_https_origin_rejects_unsafe_or_ambiguous_values(self):
+        invalid_origins = (
+            "http://media.example.com",
+            "https://user@media.example.com",
+            "https://media.example.com/path",
+            "https://media.example.com?query=yes",
+            "https://media.example.com#fragment",
+            "https://media.example.com:",
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://localhost",
+            "https://media.example.com.",
+            "https://-media.example.com",
+        )
+
+        for origin in invalid_origins:
+            with self.subTest(origin=origin):
+                with self.assertRaises(ValueError):
+                    app_config.normalize_https_origin(origin)
+
     def test_configuration_warnings_do_not_embed_example_placeholders(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             warnings = app_config.configuration_warnings(("AZURE_DEVOPS_TEAM_ID", "AZURE_DEVOPS_USER"))

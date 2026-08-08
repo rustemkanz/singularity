@@ -3,9 +3,10 @@ import difflib
 import json
 import os
 
-from app_config import DEFAULT_REPO, ORG, PROJECT
+from app_config import DEFAULT_REPO, GITLAB_BASE_URL, ORG, PROJECT
 from errors import CliError
 from git_client import infer_git_repository_ref
+from mutation_plans import MutationPlan, render_plan_preview, require_approved_plan
 
 
 REVIEW_DRAFT_FORMAT_VERSION = 1
@@ -15,6 +16,41 @@ def _require_provider(factory, provider_label: str):
     if factory is None:
         raise RuntimeError(f"Missing {provider_label} provider factory.")
     return factory
+
+
+def _review_target(context) -> dict:
+    return {
+        "provider": context.change_request.provider,
+        "organization": context.organization,
+        "project": context.project,
+        "repository": {
+            "id": context.repository.id,
+            "name": context.repository.name,
+        },
+        "changeRequestId": context.change_request.id,
+    }
+
+
+def _preview_or_apply(args, plan: MutationPlan) -> bool:
+    should_apply = require_approved_plan(plan, getattr(args, "apply", None))
+    if not should_apply:
+        print(render_plan_preview(plan, json_output=getattr(args, "json", False)))
+    return should_apply
+
+
+def _add_apply_plan_arguments(parser, *, keep_dry_run: bool = True) -> None:
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="Apply only the exact previewed plan identified by PLAN_ID",
+    )
+    if keep_dry_run:
+        mode.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Explicitly preview without applying (the default; retained for compatibility)",
+        )
 
 
 def normalize_repo_path(path: str) -> str:
@@ -61,6 +97,8 @@ def load_review_draft(path: str) -> dict:
         raise CliError(f"ERROR: Review draft file not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise CliError(f"ERROR: Review draft file is not valid JSON: {exc}") from exc
+    if not isinstance(draft, dict):
+        raise CliError("ERROR: Review draft root must be a JSON object.")
     if draft.get("formatVersion") != REVIEW_DRAFT_FORMAT_VERSION:
         raise CliError(
             f"Unsupported review draft format version {draft.get('formatVersion')!r}; expected {REVIEW_DRAFT_FORMAT_VERSION}."
@@ -222,12 +260,10 @@ def cmd_repos(args, token, *, build_review_provider_func=None):
 
 
 def _require_explicit_change_request_target(args) -> None:
-    if not getattr(args, "apply", False):
-        return
     missing = [flag for flag, value in (("--repo", args.repo), ("--source", args.source)) if not value]
     if missing:
         raise CliError(
-            "ERROR: Applying a pull-request operation requires explicit "
+            "ERROR: Pull-request planning requires explicit "
             f"{' and '.join(missing)} values so the target cannot be inferred from the wrong checkout."
         )
 
@@ -245,80 +281,23 @@ def cmd_create_pr(args, token, *, build_review_provider_func=None):
         work_item_title=args.work_item_title,
     )
 
-    if getattr(args, "dry_run", False) or not getattr(args, "apply", False):
-        label = "Dry run" if getattr(args, "dry_run", False) else "Plan"
-        print(f"{label}: create PR payload")
-        print(json.dumps({
+    provider_name = getattr(args, "provider", "azure-devops")
+    mutation_plan = MutationPlan(
+        action="change-request.create",
+        target={
+            "provider": provider_name,
+            "organization": GITLAB_BASE_URL if provider_name == "gitlab" else ORG,
+            "project": repository.project if provider_name == "gitlab" else PROJECT,
             "repository": {"id": repository.id, "name": repository.name},
-            "payload": payload,
-        }, indent=2))
-        if not getattr(args, "dry_run", False):
-            print("Preview only: no pull request was created. Re-run with --apply after approval.")
+            "workItemId": args.id,
+        },
+        payload=payload,
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    change_request = provider.create_change_request(
-        work_item_id=args.id,
-        repo_ref=args.repo,
-        source_branch=args.source,
-        target_branch=args.target,
-        title=args.title,
-        description=args.description,
-        work_item_title=args.work_item_title,
-    )
+    change_request = provider.create_prepared_change_request(repository, mutation_plan.payload)
     print(f"✓ Pull request created in {change_request.repo_name}.")
-    print(f"  PR ID   : {change_request.id}")
-    print(f"  Title   : {change_request.title}")
-    print(f"  Status  : {change_request.status}")
-    print(f"  URL     : {change_request.api_url}")
-
-
-def cmd_prepare_review(
-    args,
-    token,
-    *,
-    build_review_provider_func=None,
-    build_work_tracking_provider_func=None,
-):
-    _require_explicit_change_request_target(args)
-    review_provider = _require_provider(build_review_provider_func, "review")(token)
-    repository, payload = review_provider.prepare_change_request(
-        work_item_id=args.id,
-        repo_ref=args.repo,
-        source_branch=args.source,
-        target_branch=args.target,
-        title=args.title,
-        description=args.description,
-        work_item_title=args.work_item_title,
-    )
-
-    if getattr(args, "dry_run", False) or not getattr(args, "apply", False):
-        label = "Dry run" if getattr(args, "dry_run", False) else "Plan"
-        print(f"{label}: prepare-review payload")
-        print(json.dumps({
-            "repository": {"id": repository.id, "name": repository.name},
-            "pull_request": payload,
-            "work_item_transition": {
-                "id": args.id,
-                "state": "In Review",
-            },
-        }, indent=2))
-        if not getattr(args, "dry_run", False):
-            print("Preview only: no pull request was created and no work-item state was changed. Re-run with --apply after approval.")
-        return
-
-    change_request = review_provider.create_change_request(
-        work_item_id=args.id,
-        repo_ref=args.repo,
-        source_branch=args.source,
-        target_branch=args.target,
-        title=args.title,
-        description=args.description,
-        work_item_title=args.work_item_title,
-    )
-    work_tracking_provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
-    actual_state = work_tracking_provider.transition_work_item(item_id=args.id, state="In Review")
-    rendered_state = actual_state if isinstance(actual_state, str) and actual_state else "In Review"
-    print(f"✓ Pull request created in {change_request.repo_name} and work item {args.id} moved to '{rendered_state}'.")
     print(f"  PR ID   : {change_request.id}")
     print(f"  Title   : {change_request.title}")
     print(f"  Status  : {change_request.status}")
@@ -520,15 +499,15 @@ def cmd_pr_comment(args, token, *, build_review_provider_func=None):
         url=args.url,
     )
     preview = provider.prepare_review_comment(context, text=args.text)
-    if args.dry_run:
-        print("Dry run: create PR thread payload")
-        print(json.dumps({
-            "pullRequest": context.change_request.to_summary_dict(),
-            "payload": preview.payload,
-        }, indent=2))
+    mutation_plan = MutationPlan(
+        action="review.comment.create",
+        target=_review_target(context),
+        payload=preview.payload,
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    result = provider.create_review_comment(context, text=args.text)
+    result = provider.create_prepared_review_comment(context, preview)
     print(
         f"✓ Comment thread {result.thread_id} created on PR {context.change_request.id} "
         f"in {context.change_request.repo_name}."
@@ -552,23 +531,15 @@ def cmd_pr_inline_comment(args, token, *, build_review_provider_func=None):
         start_offset=args.start_offset,
         end_offset=args.end_offset,
     )
-    if args.dry_run:
-        print("Dry run: create inline PR thread payload")
-        print(json.dumps({
-            "pullRequest": context.change_request.to_summary_dict(),
-            "payload": preview.payload,
-        }, indent=2))
+    mutation_plan = MutationPlan(
+        action="review.inline-comment.create",
+        target={**_review_target(context), "filePath": normalize_repo_path(args.path)},
+        payload=preview.payload,
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    result = provider.create_inline_review_comment(
-        context,
-        text=args.text,
-        file_path=args.path,
-        line=args.line,
-        end_line=args.end_line,
-        start_offset=args.start_offset,
-        end_offset=args.end_offset,
-    )
+    result = provider.create_prepared_inline_review_comment(context, preview)
     print(
         f"✓ Inline thread {result.thread_id} created on PR {context.change_request.id} "
         f"for {normalize_repo_path(args.path)}:{args.line}."
@@ -589,21 +560,15 @@ def cmd_pr_reply(args, token, *, build_review_provider_func=None):
         text=args.text,
         parent_comment_id=args.parent_comment,
     )
-    if args.dry_run:
-        print("Dry run: create PR reply payload")
-        print(json.dumps({
-            "pullRequest": context.change_request.to_summary_dict(),
-            "threadId": preview.thread_id,
-            "payload": preview.payload,
-        }, indent=2))
+    mutation_plan = MutationPlan(
+        action="review.reply.create",
+        target={**_review_target(context), "threadId": preview.thread_id},
+        payload=preview.payload,
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    result = provider.create_review_reply(
-        context,
-        thread_id=args.thread,
-        text=args.text,
-        parent_comment_id=args.parent_comment,
-    )
+    result = provider.create_prepared_review_reply(context, preview)
     print(
         f"✓ Reply added to thread {result.thread_id} on PR {context.change_request.id} "
         f"(comment id: {result.comment_id})."
@@ -624,23 +589,22 @@ def cmd_pr_edit_comment(args, token, *, build_review_provider_func=None):
         comment_id=args.comment,
         text=args.text,
     )
-    if args.dry_run:
-        print("Dry run: edit PR comment payload")
-        print(json.dumps({
-            "pullRequest": context.change_request.to_summary_dict(),
+    mutation_plan = MutationPlan(
+        action="review.comment.edit",
+        target={
+            **_review_target(context),
             "threadId": preview.thread_id,
             "commentId": preview.comment_id,
+        },
+        payload={
             "currentContent": preview.current_content,
-            "payload": preview.payload,
-        }, indent=2))
+            **preview.payload,
+        },
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    result = provider.edit_review_comment(
-        context,
-        thread_id=args.thread,
-        comment_id=args.comment,
-        text=args.text,
-    )
+    result = provider.edit_prepared_review_comment(context, preview)
     print(
         f"✓ Comment {result.comment_id} updated in thread {result.thread_id} on PR "
         f"{context.change_request.id}."
@@ -656,21 +620,18 @@ def cmd_pr_resolve(args, token, *, build_review_provider_func=None):
         url=args.url,
     )
     preview = provider.prepare_review_thread_resolution(context, thread_id=args.thread, status="fixed")
-    if args.dry_run:
-        print("Dry run: resolve PR thread payload")
-        print(json.dumps({
-            "pullRequest": context.change_request.to_summary_dict(),
-            "threadId": preview.thread_id,
+    mutation_plan = MutationPlan(
+        action="review.thread.resolve",
+        target={**_review_target(context), "threadId": preview.thread_id},
+        payload={
             "currentStatus": preview.current_status,
-            "payload": preview.payload,
-        }, indent=2))
+            **preview.payload,
+        },
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    result = provider.resolve_review_thread(
-        context,
-        thread_id=args.thread,
-        status="fixed",
-    )
+    result = provider.resolve_prepared_review_thread(context, preview)
     print(
         f"✓ Thread {result.thread_id} marked resolved on PR {context.change_request.id} "
         f"(status: {result.status})."
@@ -688,6 +649,7 @@ def cmd_pr_review_draft(args, token, *, build_review_provider_func=None):
     analysis = provider.analyze_change_request(context)
     draft = {
         "formatVersion": REVIEW_DRAFT_FORMAT_VERSION,
+        "provider": context.change_request.provider,
         "organization": context.organization,
         "project": context.project,
         "repo": {
@@ -712,8 +674,36 @@ def cmd_pr_review_draft(args, token, *, build_review_provider_func=None):
     print(rendered)
 
 
+def _apply_review_draft_entry(provider, context, entry: dict, preview, *, index: int) -> dict:
+    entry_type = (entry.get("type") or "general").lower()
+    if entry_type in ("general", "comment"):
+        result = provider.create_prepared_review_comment(context, preview)
+        return {"index": index, "type": entry_type, "threadId": result.thread_id}
+    if entry_type == "inline":
+        result = provider.create_prepared_inline_review_comment(context, preview)
+        return {"index": index, "type": entry_type, "threadId": result.thread_id}
+    if entry_type == "reply":
+        result = provider.create_prepared_review_reply(context, preview)
+        return {"index": index, "type": entry_type, "commentId": result.comment_id}
+    if entry_type == "edit":
+        result = provider.edit_prepared_review_comment(context, preview)
+        return {"index": index, "type": entry_type, "commentId": result.comment_id}
+    if entry_type == "resolve":
+        result = provider.resolve_prepared_review_thread(context, preview)
+        return {"index": index, "type": entry_type, "status": result.status}
+    raise CliError(f"ERROR: Unsupported draft comment type '{entry_type}' in item #{index}.")
+
+
 def cmd_pr_review_apply(args, token, *, build_review_provider_func=None):
     draft = load_review_draft(args.draft_file)
+    draft_provider = draft.get("provider") or "azure-devops"
+    if draft_provider not in {"azure-devops", "gitlab"}:
+        raise CliError(f"ERROR: Unsupported review draft provider '{draft_provider}'.")
+    requested_provider = getattr(args, "provider", None)
+    if requested_provider and requested_provider != draft_provider:
+        raise CliError(
+            f"ERROR: Draft provider '{draft_provider}' does not match --provider '{requested_provider}'."
+        )
     org_name = draft.get("organization", ORG)
     project_name = draft.get("project", PROJECT)
     repo_ref = (draft.get("repo") or {}).get("id") or (draft.get("repo") or {}).get("name")
@@ -722,27 +712,47 @@ def cmd_pr_review_apply(args, token, *, build_review_provider_func=None):
         raise CliError("ERROR: Review draft is missing repo or pullRequest.pullRequestId metadata.")
 
     provider = _require_provider(build_review_provider_func, "review")(token)
+    review_url = None
+    if draft_provider == "gitlab":
+        review_url = f"{str(org_name).rstrip('/')}/{str(project_name).strip('/')}/-/merge_requests/{pr_id}"
     context = provider.resolve_review_context(
         repo_ref=repo_ref,
         change_request_id=int(pr_id),
         source_branch=None,
-        url=None,
+        url=review_url,
         project_name=project_name,
         org_name=org_name,
     )
-    results: list[dict] = []
+    draft_comments = draft.get("draftComments", [])
+    if not isinstance(draft_comments, list) or any(not isinstance(entry, dict) for entry in draft_comments):
+        raise CliError("ERROR: Review draft draftComments must be an array of objects.")
+    if not draft_comments:
+        raise CliError("ERROR: Review draft has no actions to preview or apply.")
 
-    for index, entry in enumerate(draft.get("draftComments", []), start=1):
+    entry_index = getattr(args, "entry", None)
+    if entry_index is None:
+        if len(draft_comments) != 1:
+            raise CliError(
+                f"ERROR: Review draft contains {len(draft_comments)} actions. Pass --entry <INDEX> "
+                "so each external mutation receives its own preview and approval."
+            )
+        entry_index = 1
+    if entry_index < 1 or entry_index > len(draft_comments):
+        raise CliError(
+            f"ERROR: --entry must be between 1 and {len(draft_comments)} for this review draft."
+        )
+
+    planned_actions: list[dict] = []
+    prepared_actions: list[tuple[int, dict, object]] = []
+
+    for index, entry in ((entry_index, draft_comments[entry_index - 1]),):
         entry_type = (entry.get("type") or "general").lower()
         if entry_type in ("general", "comment"):
             if not entry.get("text"):
                 raise CliError(f"ERROR: Draft comment #{index} is missing text.")
             preview = provider.prepare_review_comment(context, text=entry["text"])
-            if args.dry_run:
-                results.append({"index": index, "type": entry_type, "payload": preview.payload})
-                continue
-            result = provider.create_review_comment(context, text=entry["text"])
-            results.append({"index": index, "type": entry_type, "threadId": result.thread_id})
+            planned_actions.append({"index": index, "type": entry_type, "payload": preview.payload})
+            prepared_actions.append((index, entry, preview))
             continue
 
         if entry_type == "inline":
@@ -757,19 +767,8 @@ def cmd_pr_review_apply(args, token, *, build_review_provider_func=None):
                 start_offset=int(entry.get("startOffset", 1)),
                 end_offset=int(entry["endOffset"]) if entry.get("endOffset") is not None else None,
             )
-            if args.dry_run:
-                results.append({"index": index, "type": entry_type, "payload": preview.payload})
-                continue
-            result = provider.create_inline_review_comment(
-                context,
-                text=entry["text"],
-                file_path=entry["path"],
-                line=int(entry["line"]),
-                end_line=int(entry["endLine"]) if entry.get("endLine") is not None else None,
-                start_offset=int(entry.get("startOffset", 1)),
-                end_offset=int(entry["endOffset"]) if entry.get("endOffset") is not None else None,
-            )
-            results.append({"index": index, "type": entry_type, "threadId": result.thread_id})
+            planned_actions.append({"index": index, "type": entry_type, "payload": preview.payload})
+            prepared_actions.append((index, entry, preview))
             continue
 
         if entry_type == "reply":
@@ -781,16 +780,13 @@ def cmd_pr_review_apply(args, token, *, build_review_provider_func=None):
                 text=entry["text"],
                 parent_comment_id=int(entry["parentCommentId"]) if entry.get("parentCommentId") is not None else None,
             )
-            if args.dry_run:
-                results.append({"index": index, "type": entry_type, "payload": preview.payload})
-                continue
-            result = provider.create_review_reply(
-                context,
-                thread_id=entry["threadId"],
-                text=entry["text"],
-                parent_comment_id=int(entry["parentCommentId"]) if entry.get("parentCommentId") is not None else None,
-            )
-            results.append({"index": index, "type": entry_type, "commentId": result.comment_id})
+            planned_actions.append({
+                "index": index,
+                "type": entry_type,
+                "threadId": entry["threadId"],
+                "payload": preview.payload,
+            })
+            prepared_actions.append((index, entry, preview))
             continue
 
         if entry_type == "edit":
@@ -802,16 +798,15 @@ def cmd_pr_review_apply(args, token, *, build_review_provider_func=None):
                 comment_id=int(entry["commentId"]),
                 text=entry["text"],
             )
-            if args.dry_run:
-                results.append({"index": index, "type": entry_type, "payload": preview.payload})
-                continue
-            result = provider.edit_review_comment(
-                context,
-                thread_id=entry["threadId"],
-                comment_id=int(entry["commentId"]),
-                text=entry["text"],
-            )
-            results.append({"index": index, "type": entry_type, "commentId": result.comment_id})
+            planned_actions.append({
+                "index": index,
+                "type": entry_type,
+                "threadId": entry["threadId"],
+                "commentId": int(entry["commentId"]),
+                "currentContent": preview.current_content,
+                "payload": preview.payload,
+            })
+            prepared_actions.append((index, entry, preview))
             continue
 
         if entry_type == "resolve":
@@ -822,30 +817,31 @@ def cmd_pr_review_apply(args, token, *, build_review_provider_func=None):
                 thread_id=entry["threadId"],
                 status="fixed",
             )
-            if args.dry_run:
-                results.append({"index": index, "type": entry_type, "payload": preview.payload})
-                continue
-            result = provider.resolve_review_thread(
-                context,
-                thread_id=entry["threadId"],
-                status="fixed",
-            )
-            results.append({"index": index, "type": entry_type, "status": result.status})
+            planned_actions.append({
+                "index": index,
+                "type": entry_type,
+                "threadId": entry["threadId"],
+                "currentStatus": preview.current_status,
+                "payload": preview.payload,
+            })
+            prepared_actions.append((index, entry, preview))
             continue
 
         raise CliError(f"ERROR: Unsupported draft comment type '{entry_type}' in item #{index}.")
 
-    if args.dry_run:
-        print(json.dumps({
-            "pullRequest": {
-                **serialize_pr_summary(context.change_request),
-                "browserUrl": pr_browser_url(context.change_request),
-            },
-            "plannedActions": results,
-        }, indent=2))
+    mutation_plan = MutationPlan(
+        action="review.draft-entry.apply",
+        target=_review_target(context),
+        payload={
+            "formatVersion": draft["formatVersion"],
+            "action": planned_actions[0],
+        },
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    for result in results:
+    for index, entry, preview in prepared_actions:
+        result = _apply_review_draft_entry(provider, context, entry, preview, index=index)
         print(json.dumps(result))
 
 
@@ -895,39 +891,20 @@ def register_review_subcommands(sub):
     p = sub.add_parser("repos", help="List git repositories in the project")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
-    p = sub.add_parser("create-pr", help="Preview a pull/merge request; use --apply to create it")
+    p = sub.add_parser("create-pr", help="Preview a pull/merge request; create only by exact Plan ID")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Review provider to use for change-request creation (default: azure-devops)")
-    p.add_argument("--repo", metavar="REPO", help="Repository name or id (required with --apply)")
-    p.add_argument("--source", metavar="BRANCH", help="Source branch name (required with --apply; preview defaults to current git branch)")
+    p.add_argument("--repo", required=True, metavar="REPO", help="Explicit repository name or id")
+    p.add_argument("--source", required=True, metavar="BRANCH", help="Explicit source branch name")
     p.add_argument("--target", metavar="BRANCH", default="main",
                    help="Target branch name (default: main)")
     p.add_argument("--title", metavar="TEXT", help="PR title (default: derived from work item)")
     p.add_argument("--description", metavar="TEXT", help="PR description (default: Closes #<id>)")
     p.add_argument("--work-item-title", metavar="TEXT",
                    help="Optional pre-fetched tracking-item title to avoid an extra API call")
-    mode = p.add_mutually_exclusive_group()
-    mode.add_argument("--apply", action="store_true",
-                      help="Create the pull request or merge request after reviewing the payload")
-    mode.add_argument("--dry-run", action="store_true",
-                      help="Explicitly print the payload without creating the PR (the default; retained for compatibility)")
-
-    p = sub.add_parser("prepare-review", help="Preview PR creation and review handoff; use --apply to perform both")
-    p.add_argument("id", type=int)
-    p.add_argument("--repo", metavar="REPO", help="Repository name or id (required with --apply)")
-    p.add_argument("--source", metavar="BRANCH", help="Source branch name (required with --apply; preview defaults to current git branch)")
-    p.add_argument("--target", metavar="BRANCH", default="main",
-                   help="Target branch name (default: main)")
-    p.add_argument("--title", metavar="TEXT", help="PR title (default: derived from work item)")
-    p.add_argument("--description", metavar="TEXT", help="PR description (default: Closes #<id>)")
-    p.add_argument("--work-item-title", metavar="TEXT",
-                   help="Optional pre-fetched work item title to avoid an extra API call")
-    mode = p.add_mutually_exclusive_group()
-    mode.add_argument("--apply", action="store_true",
-                      help="Create the PR and move the work item to 'In Review' after reviewing the payload")
-    mode.add_argument("--dry-run", action="store_true",
-                      help="Explicitly print the PR and transition payload (the default; retained for compatibility)")
+    p.add_argument("--json", action="store_true", help="Emit the mutation plan as structured JSON")
+    _add_apply_plan_arguments(p)
 
     p = sub.add_parser("pr-analyze", help="Summarize a PR from a URL or repo/PR reference")
     p.add_argument("--url", metavar="PR_URL",
@@ -1013,7 +990,7 @@ def register_review_subcommands(sub):
     p.add_argument("--json", action="store_true",
                    help="Emit structured JSON output for scripting")
 
-    p = sub.add_parser("pr-comment", help="Add a new discussion thread to a PR")
+    p = sub.add_parser("pr-comment", help="Preview a new discussion thread on a PR")
     p.add_argument("--url", metavar="PR_URL",
                    help="Pull request or merge request URL")
     p.add_argument("--repo", metavar="REPO",
@@ -1022,11 +999,11 @@ def register_review_subcommands(sub):
                    help="Pull request id (default: resolve from --source or current branch)")
     p.add_argument("--source", metavar="BRANCH",
                    help="Source branch name or ref (default: current git branch when --pr is omitted)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the payload instead of posting the comment")
+    p.add_argument("--json", action="store_true", help="Emit the mutation plan as structured JSON")
+    _add_apply_plan_arguments(p)
     p.add_argument("text", help="Comment text")
 
-    p = sub.add_parser("pr-inline-comment", help="Add a new inline review thread on a PR file/line")
+    p = sub.add_parser("pr-inline-comment", help="Preview a new inline review thread on a PR file/line")
     p.add_argument("--url", metavar="PR_URL",
                    help="Pull request or merge request URL")
     p.add_argument("--repo", metavar="REPO",
@@ -1045,13 +1022,13 @@ def register_review_subcommands(sub):
                    help="1-based start column/offset within the start line (default: 1)")
     p.add_argument("--end-offset", type=int, metavar="COL",
                    help="1-based end column/offset within the end line")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the payload instead of posting the inline comment")
+    p.add_argument("--json", action="store_true", help="Emit the mutation plan as structured JSON")
+    _add_apply_plan_arguments(p)
     p.add_argument("text", help="Inline comment text")
 
     p = sub.add_parser(
         "pr-reply",
-        help="Reply to an existing PR review thread",
+        help="Preview a reply to an existing PR review thread",
         description=(
             "Reply to an existing PR review thread.\n\n"
             "The reply body is passed as the final positional text argument."
@@ -1075,11 +1052,11 @@ def register_review_subcommands(sub):
                    help="Thread id from pr-comments output")
     p.add_argument("--parent-comment", type=int, metavar="COMMENT_ID",
                    help="Parent comment id inside the thread (default: root text comment)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the payload instead of posting the reply")
+    p.add_argument("--json", action="store_true", help="Emit the mutation plan as structured JSON")
+    _add_apply_plan_arguments(p)
     p.add_argument("text", help="Reply text (final positional argument)")
 
-    p = sub.add_parser("pr-edit-comment", help="Edit an existing PR thread comment")
+    p = sub.add_parser("pr-edit-comment", help="Preview editing an existing PR thread comment")
     p.add_argument("--url", metavar="PR_URL",
                    help="Pull request or merge request URL")
     p.add_argument("--repo", metavar="REPO",
@@ -1092,11 +1069,11 @@ def register_review_subcommands(sub):
                    help="Thread id from pr-comments output")
     p.add_argument("--comment", required=True, type=int, metavar="COMMENT_ID",
                    help="Comment id from ado pr-comments output or --json output")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the payload instead of updating the comment")
+    p.add_argument("--json", action="store_true", help="Emit the mutation plan as structured JSON")
+    _add_apply_plan_arguments(p)
     p.add_argument("text", help="Updated comment text")
 
-    p = sub.add_parser("pr-resolve", help="Mark a PR review thread as resolved")
+    p = sub.add_parser("pr-resolve", help="Preview resolving a PR review thread")
     p.add_argument("--url", metavar="PR_URL",
                    help="Pull request or merge request URL")
     p.add_argument("--repo", metavar="REPO",
@@ -1107,8 +1084,8 @@ def register_review_subcommands(sub):
                    help="Source branch name or ref (default: current git branch when --pr is omitted)")
     p.add_argument("--thread", required=True, metavar="THREAD_ID",
                    help="Thread id from pr-comments output")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the payload instead of resolving the thread")
+    p.add_argument("--json", action="store_true", help="Emit the mutation plan as structured JSON")
+    _add_apply_plan_arguments(p)
 
     p = sub.add_parser("pr-review-draft", help="Create a JSON review draft bundle for later approval/posting")
     p.add_argument("--url", metavar="PR_URL",
@@ -1122,18 +1099,21 @@ def register_review_subcommands(sub):
     p.add_argument("--output", metavar="FILE",
                    help="Optional path to write the draft JSON instead of stdout")
 
-    p = sub.add_parser("pr-review-apply", help="Apply review comments from a draft JSON file")
+    p = sub.add_parser("pr-review-apply", help="Preview one mutation entry from a review draft")
     p.add_argument("draft_file", metavar="FILE",
                    help="Review draft JSON file created by pr-review-draft or edited manually")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Validate and print planned review actions instead of posting them")
+    p.add_argument("--entry", type=int, metavar="INDEX",
+                   help="Apply one 1-based draft entry (required when the draft has multiple actions)")
+    p.add_argument("--provider", choices=("azure-devops", "gitlab"),
+                   help="Override provider routing only when it matches the draft metadata")
+    p.add_argument("--json", action="store_true", help="Emit the mutation plan as structured JSON")
+    _add_apply_plan_arguments(p)
 
 
 def review_command_handlers() -> dict[str, callable]:
     return {
         "repos": cmd_repos,
         "create-pr": cmd_create_pr,
-        "prepare-review": cmd_prepare_review,
         "pr-analyze": cmd_pr_analyze,
         "pr-files": cmd_pr_files,
         "pr-file": cmd_pr_file,

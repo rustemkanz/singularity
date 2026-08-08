@@ -10,18 +10,18 @@ When the user asks Copilot to pick up, inspect, or progress ADO work, follow thi
 4. Use `sg show <id>` to inspect the work item before starting implementation.
 5. If screenshots, attachments, or pasted UI context may matter, use `sg attachments <id>` so local context includes the work item media.
 6. If description, acceptance criteria, or expected behavior are unclear, do not start coding yet.
-7. In that unclear case, preview a clarification with `sg comment <id> "..."`; show the exact text, get explicit approval, and only then repeat it with `--apply`.
-8. If the work item is clear enough to implement, use plan-only `sg start-work <id>` or preview `sg start <id>` to inspect the same canonical branch/state plan. `start-work` never changes state; run `sg start <id> --apply` only after explicit approval.
+7. In that unclear case, preview a clarification with `sg comment <id> "..."`; show the exact text and Plan ID, get explicit approval, and only then repeat the otherwise unchanged command with `--apply <PLAN_ID>`.
+8. If the work item is clear enough to implement, use `sg start <id>` as the single canonical branch/state plan. It never creates the branch; run it with the exact approved Plan ID only after explicit approval.
 9. Create the exact planned branch in the verified target checkout, then implement and run the narrowest relevant validation.
-10. Once the change is ready for review, preview the PR with `sg create-pr <id> --repo <repo> --source <branch>`. Show the full payload and create it with `--apply` only after explicit approval.
-11. Preview `sg review <id>` and apply the review transition only after separate approval with `sg review <id> --apply`.
+10. Once the change is ready for review, preview the PR with `sg create-pr <id> --repo <repo> --source <branch>`. Show the full payload and Plan ID, then create it with `--apply <PLAN_ID>` only after explicit approval.
+11. Preview `sg review <id>` and apply the review transition with its own Plan ID only after separate approval. Never combine PR creation and the state transition.
 12. Hand off to QA only after the user separately requests and approves that external action.
 
 Operational expectations:
 
 - Copilot is the worker. Prefer taking the next safe action instead of telling the user to run the helper manually.
 - Treat the user's implementation request as approval for local inspection, edits, and tests, not for external mutations.
-- Before every external mutation, show the exact action and payload and obtain explicit approval for that action. Approval does not carry over to the next mutation.
+- Before every external mutation, run the command without `--apply`, show its exact target, payload, and `sha256:` Plan ID, and obtain explicit approval. Then rerun the otherwise unchanged command with `--apply <PLAN_ID>`. The Git-worktree-identity-bound ID expires after one hour and is consumed by the first validated provider-dispatch attempt; approval does not carry over to the next mutation or a retry. After a timeout or other ambiguous response, inspect provider state before previewing a retry.
 - Use the CLI instead of rebuilding raw Azure DevOps REST calls unless the CLI is missing a required feature.
 - If a needed ADO action is missing from `sg.py`, extend the script first when practical, then use it.
 - When changing user-visible helper behavior or workflow steps, update `CHANGELOG.md` in the same change.
@@ -32,7 +32,7 @@ Operational expectations:
 - Prefer small, reviewable branches and changes scoped to a single work item.
 - When creating or updating a PR, link it clearly to the work item.
 - Always pass explicit `--repo` and `--source` values to PR commands; do not infer them from the Singularity source checkout.
-- `comment`, `start`, `create-pr`, `prepare-review`, and `review` preview by default. Add `--apply` only after approval; `--dry-run` remains a compatibility alias for PR previews. Treat older mutators without `--apply` as immediate and do not invoke them before approval.
+- Every external mutator previews by default and requires its exact Plan ID with `--apply`. A changed or stale plan must be previewed and approved again; `--dry-run` remains a compatibility alias on commands that previously exposed it.
 - Keep the helper portable by preferring environment variables over hard-coded organization, project, assignee, and QA settings.
 - When drafting or posting AI-authored text to external systems such as ADO work item comments or PR threads, keep the body natural and concise.
 - Use the short trailing disclosure `AI-assisted via Copilot.` instead of bracket-heavy prefixes unless the target system provides its own machine-readable AI attribution field.

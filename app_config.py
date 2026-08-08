@@ -1,9 +1,11 @@
-import os
-from pathlib import Path
-import ssl
 import importlib
+import ipaddress
+import os
+import re
+import ssl
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -18,7 +20,13 @@ REQUIRED_ENV_VARS = (
 OPTIONAL_ENV_DEFAULTS = {
     "AZURE_DEVOPS_RESOURCE": "499b84ac-1321-427f-aa17-267ca6975798",
     "AZURE_DEVOPS_API_VERSION": "7.1",
+    "AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS": "",
 }
+
+HOST_LABEL_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
+    re.IGNORECASE,
+)
 
 
 def parse_env_assignment(raw_line: str) -> tuple[str, str] | None:
@@ -69,6 +77,62 @@ def configured_value(name: str, default: str | None = None) -> str | None:
     return value or default
 
 
+def normalize_https_origin(raw_origin: str) -> str:
+    """Validate and canonicalize a configured public HTTPS origin."""
+    origin = raw_origin.strip()
+    try:
+        parsed = urllib.parse.urlsplit(origin)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid HTTPS origin: {raw_origin!r}") from exc
+
+    if parsed.scheme.casefold() != "https":
+        raise ValueError(f"External media origin must use HTTPS: {raw_origin!r}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"External media origin must not include userinfo: {raw_origin!r}")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError(f"External media origin must not include a path, query, or fragment: {raw_origin!r}")
+    if parsed.netloc.endswith(":"):
+        raise ValueError(f"External media origin has an invalid port: {raw_origin!r}")
+    if port == 0:
+        raise ValueError(f"External media origin has an invalid port: {raw_origin!r}")
+
+    hostname = parsed.hostname or ""
+    if not hostname or hostname.endswith("."):
+        raise ValueError(f"External media origin must contain an exact hostname: {raw_origin!r}")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"External media origin must not use an IP literal: {raw_origin!r}")
+
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii").casefold()
+    except UnicodeError as exc:
+        raise ValueError(f"External media origin has an invalid hostname: {raw_origin!r}") from exc
+    labels = ascii_hostname.split(".")
+    if len(ascii_hostname) > 253 or len(labels) < 2 or any(
+        not HOST_LABEL_PATTERN.fullmatch(label) for label in labels
+    ):
+        raise ValueError(f"External media origin has an invalid hostname: {raw_origin!r}")
+
+    port_suffix = "" if port in (None, 443) else f":{port}"
+    return f"https://{ascii_hostname}{port_suffix}"
+
+
+def parse_https_origins(raw_value: str | None) -> tuple[str, ...]:
+    """Parse a comma-separated allowlist of exact public HTTPS origins."""
+    normalized: list[str] = []
+    for raw_origin in (raw_value or "").split(","):
+        if not raw_origin.strip():
+            continue
+        origin = normalize_https_origin(raw_origin)
+        if origin not in normalized:
+            normalized.append(origin)
+    return tuple(normalized)
+
+
 def missing_required_config(required_names: tuple[str, ...] = REQUIRED_ENV_VARS) -> list[str]:
     return [name for name in required_names if not configured_value(name)]
 
@@ -109,4 +173,10 @@ GITLAB_TOKEN = configured_value("GITLAB_TOKEN")
 GITLAB_BASE_URL = configured_value("GITLAB_BASE_URL", "https://gitlab.com")
 AZURE_DEVOPS_RESOURCE = configured_value("AZURE_DEVOPS_RESOURCE", OPTIONAL_ENV_DEFAULTS["AZURE_DEVOPS_RESOURCE"])
 API_VER = configured_value("AZURE_DEVOPS_API_VERSION", OPTIONAL_ENV_DEFAULTS["AZURE_DEVOPS_API_VERSION"])
+AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS = parse_https_origins(
+    configured_value(
+        "AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS",
+        OPTIONAL_ENV_DEFAULTS["AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS"],
+    )
+)
 BASE_URL = f"https://dev.azure.com/{ORG}/{PROJECT_ENC}" if ORG and PROJECT else ""

@@ -26,7 +26,7 @@ Use this skill when the task is primarily an Azure DevOps workflow task and `sg`
 - Verify the target checkout with `git rev-parse --show-toplevel`, `git remote -v`, and `git branch --show-current`.
 - Run an installed `sg` command from that checkout. Use this repository's `./sg` only when this is the target repository.
 - Pass explicit `--repo` and `--source` values to PR commands.
-- Treat the initial task as approval for local code work only. Before each external mutation, preview the exact action and ask for explicit approval. Add `--apply` after approval for plan-first commands; do not invoke older immediate mutators before approval.
+- Treat the initial task as approval for local code work only. Before each external mutation, run the command without `--apply`, show the exact preview and `sha256:` Plan ID, and ask for explicit approval. Then rerun the otherwise unchanged command with `--apply <PLAN_ID>`. The ID is bound to the verified Git worktree identity, expires after one hour, and is consumed by the first validated provider-dispatch attempt. After a timeout or ambiguous response, inspect provider state before previewing a retry because the mutation may already have succeeded.
 - Use Singularity before rebuilding raw Azure DevOps REST calls. If it lacks a needed action, extend it first when practical.
 
 ## Procedure
@@ -34,7 +34,7 @@ Use this skill when the task is primarily an Azure DevOps workflow task and `sg`
 1. Inspect the work item or PR context before changing code.
 2. If screenshots or pasted UI evidence may matter, fetch attachments locally.
 3. If requirements are unclear, preview a clarification comment instead of making speculative changes; post it only after approval.
-4. Use plan-only `start-work` or preview `start` to obtain the same canonical branch/state plan. Only `start --apply` changes provider state, and only after approval; neither command creates the local branch.
+4. Use `start` as the single canonical branch/state plan. It previews by default and supports `--json`; only an exact approved Plan ID changes provider state. It does not create the local branch.
 5. Create the exact planned branch in the target checkout.
 6. After implementation and local validation, preview a PR with explicit repo and source values; create it only after approval.
 7. Use the PR analysis and PR comment commands for review follow-up instead of guessing the current thread state.
@@ -48,15 +48,14 @@ sg ready-items
 sg show <id>
 sg comments <id> --latest 5
 sg attachments <id>
-sg start-work <id>
 sg start <id>
-sg start <id> --apply
+sg start <id> --apply <PLAN_ID>
 sg create-pr <id> --repo <repo> --source <branch>
-sg create-pr <id> --repo <repo> --source <branch> --apply
+sg create-pr <id> --repo <repo> --source <branch> --apply <PLAN_ID>
 sg pr-analyze --url <ado-pr-url>
 sg pr-comments --url <ado-pr-url> --unresolved-only
 sg review <id>
-sg review <id> --apply
+sg review <id> --apply <PLAN_ID>
 ```
 
 ## Guardrails
@@ -66,6 +65,7 @@ sg review <id> --apply
 - Do not move items forward prematurely.
 - Do not infer external-mutation approval from a request to fix or implement an item.
 - Do not reuse one approval for a later comment, transition, PR, review action, pipeline action, or QA handoff.
+- Do not change a previewed command while applying it or substitute a new Plan ID; preview and request approval again after any mismatch.
 - Prefer concise, natural external comments and PR replies.
 - Use `AI-assisted via Copilot.` as the short trailing disclosure when disclosure is needed.
 

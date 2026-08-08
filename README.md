@@ -37,7 +37,7 @@ The current implementation ships the broadest support for Azure DevOps today, al
 - Creating pull requests and moving work items through review and testing states.
 - Inspecting PR files, diffs, comments, and review threads.
 - Drafting, posting, editing, replying to, and resolving review comments.
-- Inspecting build status with failure-tail summaries, delta-oriented watch output, visible build reasons, task log ids, stage or active or failed filters, richer pending explanations, direct build step logs, latest matching builds by branch or commit, queueing builds with duplicate-run warnings, and optionally approving pending pipeline gates while watching.
+- Inspecting build status with failure-tail summaries, delta-oriented watch output, visible build reasons, task log ids, stage or active or failed filters, richer pending explanations, direct build step logs, latest matching builds by branch or commit, duplicate-safe build queueing, and optionally approving pending pipeline gates while watching.
 
 The source checkout includes a local `./sg` wrapper. For agent-assisted work in another repository, install the package so the `sg` entrypoint can be run from the target code checkout.
 
@@ -120,6 +120,14 @@ Optional fallback when you are not running inside the target work repo:
 export AZURE_DEVOPS_DEFAULT_REPO="your-repo-name"
 ```
 
+Off-origin work-item media is blocked by default. If a trusted CDN is required, allow only its exact public HTTPS origin:
+
+```bash
+export AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS="https://media.example.com,https://cdn.example.com"
+```
+
+Paths, wildcard domains, HTTP origins, IP literals, and private/link-local DNS destinations are rejected. Every redirect is checked again, and Azure credentials remain limited to the configured Azure DevOps organization.
+
 Optional GitLab configuration for merge-request and issue workflows:
 
 ```bash
@@ -156,20 +164,18 @@ sg show 123456
 sg comments 123456 --latest 5
 sg attachments 123456
 sg start 123456
-# After approving the displayed start plan:
-sg start 123456 --apply
+# After approving that exact displayed Plan ID:
+sg start 123456 --apply <PLAN_ID>
 sg create-pr 123456 --repo your-repo --source fix/123456-example
-# After separately approving the displayed PR payload:
-sg create-pr 123456 --repo your-repo --source fix/123456-example --apply
+# After separately approving that exact PR Plan ID:
+sg create-pr 123456 --repo your-repo --source fix/123456-example --apply <PLAN_ID>
 ```
 
-### `start-work` versus `start`
+Every mutation follows the same two-invocation contract: preview without `--apply`, then rerun the otherwise unchanged command with `--apply <PLAN_ID>`. The full `sha256:` ID binds the action, provider target, payload, verified Git worktree identity, and a short-lived nonce. It is stored locally as a one-shot approval grant, expires after one hour, and is consumed before the provider request begins. If any material input or provider-derived default changes, the command needs a fresh preview and approval. If a provider request times out or otherwise has an ambiguous result, inspect provider state before previewing a retry so an action that actually succeeded is not duplicated.
 
-Both commands obtain the same provider-generated `StartWorkPlan`, so they cannot independently invent different default branches.
+### Starting work
 
-- `start-work <id>` is a read-only planning command. It prints branch, note, commit, and PR metadata, supports `--json`, has no `--apply`, and never changes provider state.
-- `start <id>` shows the work-item context and the same plan. Without `--apply` it is also read-only; with `--apply` it moves the item to `In Progress`. Its optional `--branch` value deliberately overrides the displayed branch plan.
-- Neither command creates or checks out a local git branch. The agent or developer creates the exact planned branch in the verified target checkout.
+`start <id>` is the single canonical start command. It prints branch, note, commit, PR, and `In Progress` transition metadata, supports `--json`, and is read-only without an exact approved Plan ID. Its optional `--branch` value deliberately overrides the displayed branch plan. It never creates or checks out a local git branch; the agent or developer creates the exact planned branch in the verified target checkout.
 
 ### PR inspection
 
@@ -181,19 +187,38 @@ sg pr-comments --url <ado-pr-url>
 sg pr-statuses --url <ado-pr-url>
 ```
 
+### Builds and approvals
+
+Build inspection is read-only. Queueing a run and approving a gate use separate immutable plans:
+
+```bash
+sg build-status <build-id> --project <project> --watch
+sg build-approvals <build-id> --project <project>
+sg approve-gate <build-id> --project <project> --approval <approval-id>
+sg approve-gate <build-id> --project <project> --approval <approval-id> --apply <PLAN_ID>
+sg queue-build --definition <definition-id> --project <project> --branch <branch> --commit <commit-ref>
+sg queue-build --definition <definition-id> --project <project> --branch <branch> --commit <commit-ref> --apply <PLAN_ID>
+# Only after inspecting an existing run and intentionally requesting a duplicate:
+sg queue-build --definition <definition-id> --project <project> --branch <branch> --commit <commit-ref> --allow-duplicate
+# After approving that exact intentional-duplicate plan:
+sg queue-build --definition <definition-id> --project <project> --branch <branch> --commit <commit-ref> --allow-duplicate --apply <PLAN_ID>
+```
+
+`queue-build` resolves `--commit` (or the selected branch/`HEAD` by default) to a full SHA before previewing. That exact `sourceVersion` and the recent matching-build snapshot are part of the Plan ID, so a moved ref or changed duplicate snapshot requires a fresh preview and approval; the Azure DevOps queue request receives the pinned `sourceVersion`. Existing matching runs block queueing by default, and `--allow-duplicate` must itself be present in both the preview and approved apply.
+
 GitLab preview uses the same review commands with a GitLab merge-request URL:
 
 ```bash
 sg show 42 --provider gitlab --repo group/project
 sg comments 42 --provider gitlab --repo group/project
 sg comment 42 --provider gitlab --repo group/project "Low-risk smoke comment."
-sg comment 42 --provider gitlab --repo group/project "Low-risk smoke comment." --apply
-sg start-work 42 --provider gitlab --repo group/project
+sg comment 42 --provider gitlab --repo group/project "Low-risk smoke comment." --apply <PLAN_ID>
 sg start 42 --provider gitlab --repo group/project --branch issue/42-smoke
-sg start 42 --provider gitlab --repo group/project --branch issue/42-smoke --apply
+sg start 42 --provider gitlab --repo group/project --branch issue/42-smoke --apply <PLAN_ID>
 sg review 42 --provider gitlab --repo group/project
-sg review 42 --provider gitlab --repo group/project --apply
+sg review 42 --provider gitlab --repo group/project --apply <PLAN_ID>
 sg testing 42 --provider gitlab --repo group/project --qa gitlab-qa-username
+sg testing 42 --provider gitlab --repo group/project --qa gitlab-qa-username --apply <PLAN_ID>
 sg pr-analyze --url https://gitlab.example.com/group/project/-/merge_requests/123
 sg pr-files --url https://gitlab.example.com/group/project/-/merge_requests/123
 sg pr-file --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md
@@ -202,11 +227,14 @@ sg pr-comment --url https://gitlab.example.com/group/project/-/merge_requests/12
 sg pr-inline-comment --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md --line 12 "Inline GitLab note."
 sg pr-reply --url https://gitlab.example.com/group/project/-/merge_requests/123 --thread <thread-id> "Thanks, updating this."
 sg create-pr 42 --provider gitlab --repo group/project --source test/42-smoke --work-item-title "Disposable smoke issue"
-sg create-pr 42 --provider gitlab --repo group/project --source test/42-smoke --work-item-title "Disposable smoke issue" --apply
+sg create-pr 42 --provider gitlab --repo group/project --source test/42-smoke --work-item-title "Disposable smoke issue" --apply <PLAN_ID>
 sg cleanup-artifacts --provider gitlab --repo group/project --issue 42 --mr 123 --branch test/42-smoke
+sg cleanup-artifacts --provider gitlab --repo group/project --issue 42 --mr 123 --branch test/42-smoke --apply <PLAN_ID>
 ```
 
-Current GitLab scope is intentionally narrower than Azure DevOps, but it is no longer read-only. GitLab issue inspection, comments, start-work planning, workflow transitions, merge-request creation, top-level review-thread mutations, inline diff comments, and disposable-artifact cleanup are now helper-backed when you pass `--provider gitlab` and an explicit GitLab project path in `--repo`. The existing positional `id` acts as the tracking-item or issue id for title and description defaults in `create-pr`. Public merge-request analysis, files, and diffs are still validated without `GITLAB_TOKEN` on public targets, while `pr-comments` and `pr-statuses` can still require `GITLAB_TOKEN` because GitLab may gate those API endpoints even when the merge request itself is public. Build flows still remain out of scope. The likely GitLab analogue for the ADO work-item loop is issue-plus-merge-request pairing; that loop is now helper-backed through review handoff, but GitLab's own issue APIs did not immediately surface a newly created related merge request during live validation.
+For branch cleanup, the preview resolves the GitLab project’s numeric identity and each branch’s exact commit SHA. Apply rechecks those branch tips immediately before deletion and rejects a missing branch or changed tip (including a branch recreated at a different commit), so a stale approval cannot delete a different ref state.
+
+Current GitLab scope is intentionally narrower than Azure DevOps, but it is no longer read-only. GitLab issue inspection, start planning, comments, workflow transitions, merge-request creation, top-level review-thread mutations, inline diff comments, and disposable-artifact cleanup are helper-backed when you pass `--provider gitlab` and an explicit GitLab project path in `--repo`. The existing positional `id` acts as the tracking-item or issue id for title and description defaults in `create-pr`. Public merge-request analysis, files, and diffs are still validated without `GITLAB_TOKEN` on public targets, while `pr-comments` and `pr-statuses` can still require `GITLAB_TOKEN` because GitLab may gate those API endpoints even when the merge request itself is public. Build flows remain Azure DevOps-only.
 
 `pr-statuses` is useful when a PR has no discussion comments but still carries build, policy, or coverage signals.
 
@@ -216,24 +244,28 @@ Singularity is intentionally local and approval-aware.
 
 - It can inspect and prepare.
 - It can automate repetitive Azure DevOps mutations.
-- `comment`, `start`, `create-pr`, `prepare-review`, and `review` preview by default and require `--apply` for the external mutation.
-- An agent should show the exact preview and obtain approval for each action; approval for local code work or a prior mutation does not carry forward.
+- Every external mutation previews by default and requires `--apply <PLAN_ID>` for the exact current action, target, and payload.
+- An agent should show the complete preview and Plan ID and obtain approval for each action; approval for local code work or a prior mutation does not carry forward.
 - It should ask for clarification when requirements are incomplete.
 - It should not silently guess business intent.
 - It should keep human review points before high-impact external actions.
 
 ### Known safety boundaries
 
-- The uniform plan/`--apply` contract currently covers `comment`, `start`, `create-pr`, `prepare-review`, and `review`. QA handoff, pipeline queueing, cleanup, and several PR-thread mutators still use older command-specific behavior; some offer `--dry-run`, while others mutate immediately.
-- Preview and apply recompute a plan rather than applying an immutable approved artifact. Explicit `--repo` and `--source` reduce target drift for PR creation, but titles, descriptions, provider state, or other defaults can still change between the two invocations.
-- Off-origin work-item media is downloaded without Azure credentials, but there is not yet an origin allowlist or private/link-local network deny policy. Treat attachment download as network access to work-item-authored URLs.
-- `prepare-review --apply` is a two-step operation, not a transaction. If PR creation succeeds and the work-item transition fails, the PR remains and the operator must inspect provider state before retrying.
+- A Plan ID is a Git-worktree-identity-bound, one-shot grant for one recomputed plan, not a durable capability. It expires after one hour and cannot be replayed after the first validated provider-dispatch attempt in the normal workflow.
+- The local plan store is not a security boundary against another malicious process running as the same OS user. Protect the workstation and account; a same-user process that can alter Singularity's files can also tamper with local approval records.
+- Pending and consumed plan records contain hashes and approval metadata, not mutation targets or payload text.
+- Because the grant is consumed before provider dispatch, a network failure can leave the outcome unknown. Reconcile Azure DevOps or GitLab state before requesting approval for a retry.
+- PR/MR creation APIs accept a source branch rather than an atomic create-if-commit precondition. Singularity rechecks the remote tip immediately before creation and verifies the source SHA returned by the provider; if that final verification differs, the change request already exists and must be inspected instead of retried.
+- A review draft applies one selected entry per preview and approval; use `--entry <INDEX>` when a draft contains multiple actions. Artifact cleanup remains sequential, so earlier targets can succeed before a later target fails.
+- PR creation and the work-item review transition are deliberately separate commands with separate approvals. Singularity does not offer a composite `prepare-review` mutation.
+- Off-origin work-item media is denied unless its exact public HTTPS origin is configured. Allowlisting an origin authorizes anonymous network access to it, so treat that configuration as a trust decision.
 
 ## Safety notes
 
 - Review generated PR titles, descriptions, and external comments before posting when possible.
 - Treat work-item context and linked screenshots as potentially sensitive.
-- Work-item media downloads attach Azure DevOps bearer credentials only to exact trusted HTTPS organization URLs and never forward them across redirects; other embedded URLs are fetched anonymously.
+- Work-item media downloads attach Azure DevOps bearer credentials only to exact trusted HTTPS organization URLs. Every redirect is revalidated; explicitly allowed off-origin URLs are fetched anonymously, resolved addresses must be public, and connections are pinned to the validated address to prevent DNS rebinding.
 - GitLab tokens are attached only to the exact HTTPS origin configured by `GITLAB_BASE_URL` and are never forwarded across redirects.
 - Prefer explicit environment configuration over editing source defaults.
 - Keep normal network and certificate verification behavior intact.
@@ -306,8 +338,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 - Keep the local CLI as the primary operator surface.
 - Keep the repo-local skill so agents can load the workflow intentionally.
-- Extend the plan/`--apply` contract to every external mutation and bind apply operations to immutable approved plans.
-- Add external-media origin/private-network policy and resumable composite operations.
+- Add resumable journals or idempotency keys for sequential bulk cleanup operations.
 - Extract a reusable core service layer from the monolithic script.
 - Deepen the GitLab adapter toward parity with the Azure DevOps workflow surface, including build visibility.
 - Add an MCP wrapper only after the service boundaries are stable.

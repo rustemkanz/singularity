@@ -110,8 +110,15 @@ def fetch_work_item_type_states(token: str, work_item_type: str) -> list[dict]:
     return api(token, "GET", url).get("value", [])
 
 
-def resolve_transition_state_name(token: str, *, item_id: int, desired_state: str) -> str:
-    work_item = fetch_work_item(token, item_id, fields=["System.WorkItemType", "System.State"])
+def resolve_transition_state_name(
+    token: str,
+    *,
+    item_id: int,
+    desired_state: str,
+    work_item: dict | None = None,
+) -> str:
+    if work_item is None:
+        work_item = fetch_work_item(token, item_id, fields=["System.WorkItemType", "System.State"])
     work_item_type = (work_item.get("fields") or {}).get("System.WorkItemType") or "Work Item"
     supported_states = fetch_work_item_type_states(token, work_item_type)
     if not supported_states:

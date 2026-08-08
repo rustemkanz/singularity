@@ -1,6 +1,9 @@
 import urllib.error
 
 from providers.azure_devops.work_item_context import (
+    DownloadBudget,
+    DownloadLimitError,
+    MAX_DOWNLOAD_REFERENCES,
     collect_attachment_references,
     default_download_dir,
     download_reference,
@@ -67,6 +70,21 @@ class AzureDevOpsEvidenceProvider(EvidenceProvider):
         opened = False
         open_error: str | None = None
 
+        if len(references) > MAX_DOWNLOAD_REFERENCES:
+            failures.append(
+                f"Refusing to download {len(references)} references; "
+                f"the operation limit is {MAX_DOWNLOAD_REFERENCES}."
+            )
+            return EvidenceDownloadResult(
+                downloaded=downloaded,
+                download_dir=None,
+                failures=failures,
+                opened=False,
+                open_error=None,
+            )
+
+        budget = DownloadBudget()
+
         for index, reference in enumerate(references, start=1):
             try:
                 target_path, reused = download_reference(
@@ -75,6 +93,7 @@ class AzureDevOpsEvidenceProvider(EvidenceProvider):
                     download_dir,
                     index,
                     downloaded_urls,
+                    budget=budget,
                 )
                 downloaded.append(EvidenceDownloadEntry(
                     label=reference.label,
@@ -82,7 +101,10 @@ class AzureDevOpsEvidenceProvider(EvidenceProvider):
                     path=target_path,
                     reused=reused,
                 ))
-            except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
+            except DownloadLimitError as exc:
+                failures.append(f"{reference.label}: {exc}")
+                break
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
                 failures.append(f"{reference.label}: {exc}")
 
         if open_after_download and downloaded:

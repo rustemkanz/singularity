@@ -7,15 +7,27 @@ All notable changes to Singularity are tracked in this file. The project intends
 ### Added
 
 - Repo-local Codex guidance in `AGENTS.md` and `.agents/skills/azure-devops-devloop/`, including target-checkout verification and explicit repository/source selection for pull requests.
+- Immutable, provider-neutral mutation plans with full nonce-backed SHA-256 Plan IDs and local one-shot approval records.
+- Read-only `build-approvals` and approval-gated `approve-gate` commands for pipeline gates.
+- `AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS` for explicit exact-origin media trust decisions.
 
 ### Changed
 
-- `comment`, `start`, `create-pr`, `prepare-review`, and `review` now preview their external action by default and require `--apply` to mutate provider state. Existing PR `--dry-run` usage remains supported.
-- `start` and read-only `start-work` now use the same provider-generated branch and state-transition plan, including `fix/<id>-...` branches for bugs; only `start --apply` changes provider state.
+- Every external mutator now previews by default and requires `--apply <PLAN_ID>` matching the exact current action, target, provider-derived state, and payload. Plan IDs are bound to the Git worktree identity, expire after one hour, and are consumed by the first validated provider-dispatch attempt. Existing `--dry-run` usage remains a compatibility alias where previously available.
+- `start` is now the single canonical start-plan command, supports `--json`, and retains provider-generated `fix/<id>-...` branches for bugs. The redundant `start-work` command was removed; `start` still never creates a local branch.
+- PR creation and the work-item review transition now require separate `create-pr` and `review` plans and approvals. The non-transactional `prepare-review` composite was removed.
+- `build-status` is read-only; interactive gate mutation moved to the plan-first `approve-gate` command.
+- `queue-build` resolves a full Git commit before preview, binds it as `sourceVersion` plus a recent matching-build snapshot, and blocks duplicate runs unless `--allow-duplicate` is part of the separately approved plan.
+- Pull-request creation plans bind the exact provider request and current remote source-branch tip; Azure DevOps and GitLab reject apply when that branch moved after preview and verify the source SHA returned after creation.
+- Review drafts record their provider so GitLab drafts no longer route through the Azure DevOps provider.
+- Multi-action review drafts now require `--entry <INDEX>` and apply one external mutation per preview and approval.
+- Work-item transition plans now include the provider's concrete request and current state snapshot. Azure DevOps applies a revision-guarded JSON Patch, while GitLab rejects an apply if its issue snapshot changed.
+- GitLab cleanup plans now bind branch deletion to the resolved numeric project and exact branch-tip commit; apply rechecks each tip before deletion and reports completed targets immediately if a later target fails.
 
 ### Security
 
-- Azure DevOps bearer tokens are scoped to exact trusted HTTPS organization URLs when downloading work-item media, are excluded from redirects, and downloads now have timeout and size limits.
+- Azure DevOps bearer tokens are scoped to exact trusted HTTPS organization URLs when downloading work-item media. Off-origin media is denied by default; allowlisted origins must be exact public HTTPS origins, every redirect and DNS result is validated, and connections are address-pinned against DNS rebinding. Each operation is capped at 50 references, 100 MiB aggregate data, 16 address attempts, and 120 seconds; artifact creation rejects symlink/junction escapes and uses exclusive files.
+- Pending and consumed approval records are private, payload-free, Git-worktree-identity-bound, short-lived, and integrity-checked; only hashes and approval metadata are persisted.
 - GitLab tokens are scoped to the exact configured `GITLAB_BASE_URL` HTTPS origin, are excluded from redirects, and are no longer exposed through authenticated curl fallback arguments.
 
 ### Fixed

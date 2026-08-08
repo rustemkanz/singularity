@@ -151,12 +151,14 @@ class AzureDevOpsBuildProvider(BuildProvider):
         definition: int,
         project: str,
         source_branch: str,
+        source_version: str,
         parameters: dict | None,
     ) -> QueuedBuild:
         project_name = urllib.parse.quote(project)
         payload: dict = {
             "definition": {"id": definition},
             "sourceBranch": source_branch,
+            "sourceVersion": source_version,
         }
         if parameters is not None:
             payload["templateParameters"] = parameters

@@ -2,11 +2,15 @@ import argparse
 import contextlib
 import io
 import json
+import os
+import re
+import tempfile
 import unittest
 from unittest import mock
 
 from cli_commands import work_items as work_item_commands
 from errors import CliError
+from mutation_plans import PLAN_STORE_ENVIRONMENT_VARIABLE
 from providers.azure_devops import work_items as provider_work_items
 from providers.interfaces import (
     EvidenceDownloadEntry,
@@ -16,8 +20,19 @@ from providers.interfaces import (
     WorkItemCommentsSnapshot,
     WorkItemContextSnapshot,
     WorkItemEvidenceSnapshot,
+    WorkItemTransitionPreview,
 )
 import workflow_models
+
+
+PLAN_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def plan_id_from_preview(rendered: str) -> str:
+    match = PLAN_ID_PATTERN.search(rendered)
+    if match is None:
+        raise AssertionError(f"Preview did not contain a plan ID: {rendered!r}")
+    return match.group(0)
 
 
 def sprint_fixture() -> workflow_models.Sprint:
@@ -57,7 +72,42 @@ def start_work_plan_fixture() -> workflow_models.StartWorkPlan:
     )
 
 
+def transition_preview_fixture(
+    *,
+    state: str,
+    concrete_state: str | None = None,
+    assignee: str | None = None,
+) -> WorkItemTransitionPreview:
+    concrete_state = concrete_state or state
+    operations = [
+        {"op": "test", "path": "/rev", "value": 7},
+        {"op": "replace", "path": "/fields/System.State", "value": concrete_state},
+    ]
+    if assignee is not None:
+        operations.append(
+            {"op": "replace", "path": "/fields/System.AssignedTo", "value": assignee}
+        )
+    return WorkItemTransitionPreview(
+        provider="azure-devops",
+        item_id=135821,
+        requested_state=state,
+        concrete_state=concrete_state,
+        current_snapshot={"state": "New", "revision": 7},
+        request={"method": "PATCH", "operations": operations},
+    )
+
+
 class WorkItemTests(unittest.TestCase):
+    def setUp(self):
+        self._plan_store = tempfile.TemporaryDirectory()
+        self.addCleanup(self._plan_store.cleanup)
+        self._plan_store_environment = mock.patch.dict(
+            os.environ,
+            {PLAN_STORE_ENVIRONMENT_VARIABLE: self._plan_store.name},
+        )
+        self._plan_store_environment.start()
+        self.addCleanup(self._plan_store_environment.stop)
+
     def test_suggest_start_work_plan_for_bug_uses_fix_prefix(self):
         item = {
             "fields": {
@@ -188,12 +238,47 @@ class WorkItemTests(unittest.TestCase):
         self.assertEqual(resolved, "Resolved")
 
     def test_cmd_start_prefers_actual_provider_state_name_in_output(self):
-        args = argparse.Namespace(id=135821, branch=None, apply=True)
+        args = argparse.Namespace(
+            id=135821,
+            branch=None,
+            apply=None,
+            json=False,
+            provider="azure-devops",
+            repo=None,
+        )
         provider = mock.Mock()
         provider.get_start_work_plan.return_value = start_work_plan_fixture()
-        provider.transition_work_item.return_value = "Active"
+        transition_preview = transition_preview_fixture(
+            state="In Progress",
+            concrete_state="Active",
+        )
+        provider.prepare_work_item_transition.return_value = transition_preview
+        provider.apply_prepared_work_item_transition.return_value = "Active"
         cmd_show = mock.Mock()
 
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_start(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+                cmd_show_func=cmd_show,
+            )
+        approved_plan_id = plan_id_from_preview(preview_stdout.getvalue())
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = "sha256:" + "0" * 64
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(CliError, "does not match"):
+                work_item_commands.cmd_start(
+                    args,
+                    token="token",
+                    build_work_tracking_provider_func=lambda _token: provider,
+                    cmd_show_func=cmd_show,
+                )
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = approved_plan_id
+        cmd_show.reset_mock()
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             work_item_commands.cmd_start(
                 args,
@@ -202,7 +287,7 @@ class WorkItemTests(unittest.TestCase):
                 cmd_show_func=cmd_show,
             )
 
-        provider.transition_work_item.assert_called_once_with(item_id=135821, state="In Progress")
+        provider.apply_prepared_work_item_transition.assert_called_once_with(transition_preview)
         cmd_show.assert_called_once_with(args, "token")
         self.assertIn("moved to 'Active'", stdout.getvalue())
 
@@ -476,42 +561,84 @@ class WorkItemTests(unittest.TestCase):
         self.assertEqual(len(rendered["comments"]), 1)
         self.assertEqual(rendered["comments"][0]["text"], "Latest")
 
-    def test_cmd_start_work_json_uses_work_tracking_provider(self):
-        args = argparse.Namespace(id=135821, json=True)
-        plan = workflow_models.StartWorkPlan(
-            work_item=workflow_models.TrackedWorkItem(
-                id=135821,
-                title="Fix global filters",
-                kind="Bug",
-                state="Ready for development",
-                assignee="Alice",
-                iteration="Sprint 1",
-                area="Example",
-                estimate=3,
-                labels=["rpp"],
-            ),
-            branch_name="fix/135821-fix-global-filters",
-            note_path=".agent-notes/135821-fix-global-filters.md",
-            commit_prefix="fix: 135821 ",
-            change_request_title="[135821] Fix global filters",
-            concise_title="Fix global filters",
-            change_request_body="Closes #135821",
-            commands=["git checkout -b fix/135821-fix-global-filters"],
+    def test_cmd_start_json_previews_canonical_plan_without_transition(self):
+        args = argparse.Namespace(
+            id=135821,
+            branch=None,
+            apply=None,
+            json=True,
+            provider="azure-devops",
+            repo=None,
         )
-
         provider = mock.Mock()
-        provider.get_start_work_plan.return_value = plan
+        provider.get_start_work_plan.return_value = start_work_plan_fixture()
+        transition_preview = transition_preview_fixture(state="In Progress", concrete_state="Active")
+        provider.prepare_work_item_transition.return_value = transition_preview
+        cmd_show = mock.Mock()
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
-            work_item_commands.cmd_start_work(
+            work_item_commands.cmd_start(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+                cmd_show_func=cmd_show,
+            )
+
+        rendered = json.loads(stdout.getvalue())
+        self.assertEqual(rendered["plan"]["action"], "work-item.start")
+        self.assertEqual(rendered["plan"]["target"]["workItemId"], 135821)
+        self.assertEqual(
+            rendered["plan"]["payload"]["startWorkPlan"]["branchName"],
+            "fix/135821-fix-global-filters",
+        )
+        self.assertEqual(rendered["plan"]["payload"]["transition"]["concreteState"], "Active")
+        self.assertEqual(
+            rendered["plan"]["payload"]["transition"]["request"]["operations"][0],
+            {"op": "test", "path": "/rev", "value": 7},
+        )
+        self.assertEqual(rendered["applyArgument"], f"--apply {rendered['planId']}")
+        self.assertRegex(rendered["planId"], r"^sha256:[0-9a-f]{64}$")
+        provider.apply_prepared_work_item_transition.assert_not_called()
+        cmd_show.assert_not_called()
+
+    def test_cmd_start_json_reports_the_approved_plan_id_after_apply(self):
+        args = argparse.Namespace(
+            id=135821,
+            branch=None,
+            apply=None,
+            json=True,
+            provider="azure-devops",
+            repo=None,
+        )
+        provider = mock.Mock()
+        provider.get_start_work_plan.return_value = start_work_plan_fixture()
+        transition_preview = transition_preview_fixture(
+            state="In Progress",
+            concrete_state="Active",
+        )
+        provider.prepare_work_item_transition.return_value = transition_preview
+        provider.apply_prepared_work_item_transition.return_value = "Active"
+
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_start(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+        approved_plan_id = json.loads(preview_stdout.getvalue())["planId"]
+
+        args.apply = approved_plan_id
+        with contextlib.redirect_stdout(io.StringIO()) as apply_stdout:
+            work_item_commands.cmd_start(
                 args,
                 token="token",
                 build_work_tracking_provider_func=lambda _token: provider,
             )
 
-        rendered = json.loads(stdout.getvalue())
-        self.assertEqual(rendered["branchName"], "fix/135821-fix-global-filters")
-        self.assertEqual(rendered["workItem"]["id"], 135821)
+        rendered = json.loads(apply_stdout.getvalue())
+        self.assertEqual(rendered["appliedPlanId"], approved_plan_id)
+        self.assertEqual(rendered["state"], "Active")
+        provider.apply_prepared_work_item_transition.assert_called_once_with(transition_preview)
 
     def test_cmd_cleanup_artifacts_dry_run_renders_plan(self):
         args = argparse.Namespace(
@@ -521,14 +648,54 @@ class WorkItemTests(unittest.TestCase):
             merge_requests=[2],
             branches=["issue/1-smoke"],
             dry_run=True,
+            apply=None,
         )
+        provider = mock.Mock()
+        provider.prepare_cleanup.return_value = {
+            "projectId": "17",
+            "branchSnapshots": [
+                {"name": "issue/1-smoke", "commitSha": "a" * 40},
+            ],
+        }
+        provider_factory = mock.Mock(return_value=provider)
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
-            work_item_commands.cmd_cleanup_artifacts(args, token="token", cleanup_provider_factory=lambda _token: mock.Mock())
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=provider_factory,
+            )
 
-        rendered = json.loads("\n".join(stdout.getvalue().splitlines()[1:]))
-        self.assertEqual(rendered["provider"], "gitlab")
-        self.assertEqual(rendered["mergeRequests"], [2])
+        rendered = stdout.getvalue()
+        plan_id = plan_id_from_preview(rendered)
+        self.assertIn(f"--apply {plan_id}", rendered)
+        self.assertIn("Action  : artifacts.cleanup", rendered)
+        self.assertIn('"provider": "gitlab"', rendered)
+        self.assertIn('"mergeRequests": [', rendered)
+        self.assertIn('"projectId": "17"', rendered)
+        self.assertIn('"commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"', rendered)
+        self.assertIn("Preview only", rendered)
+        provider_factory.assert_called_once_with("token")
+        provider.prepare_cleanup.assert_called_once_with(branches=["issue/1-smoke"])
+        provider.cleanup_artifacts.assert_not_called()
+
+    def test_cmd_cleanup_artifacts_requires_at_least_one_target(self):
+        args = argparse.Namespace(
+            provider="gitlab",
+            repo="group/project",
+            issues=[],
+            merge_requests=[],
+            branches=[],
+            dry_run=False,
+            apply=None,
+        )
+
+        with self.assertRaisesRegex(CliError, "at least one"):
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=mock.Mock(),
+            )
 
     def test_cmd_cleanup_artifacts_applies_cleanup(self):
         args = argparse.Namespace(
@@ -538,19 +705,152 @@ class WorkItemTests(unittest.TestCase):
             merge_requests=[2],
             branches=["issue/1-smoke"],
             dry_run=False,
+            apply=None,
         )
         provider = mock.Mock()
+        provider.prepare_cleanup.return_value = {
+            "projectId": "17",
+            "branchSnapshots": [
+                {"name": "issue/1-smoke", "commitSha": "a" * 40},
+            ],
+        }
         provider.cleanup_artifacts.return_value = {
             "issues": [(1, "closed")],
             "mergeRequests": [(2, "closed")],
             "branches": ["issue/1-smoke"],
         }
+        provider_factory = mock.Mock(return_value=provider)
 
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=provider_factory,
+            )
+        approved_plan_id = plan_id_from_preview(preview_stdout.getvalue())
+        provider_factory.assert_called_once_with("token")
+
+        args.apply = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(CliError, "does not match"):
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=provider_factory,
+            )
+        self.assertEqual(provider_factory.call_count, 2)
+        provider.cleanup_artifacts.assert_not_called()
+
+        args.apply = approved_plan_id
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
-            work_item_commands.cmd_cleanup_artifacts(args, token="token", cleanup_provider_factory=lambda _token: provider)
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=provider_factory,
+            )
 
-        provider.cleanup_artifacts.assert_called_once_with(issue_ids=[1], merge_request_ids=[2], branches=["issue/1-smoke"])
+        self.assertEqual(provider_factory.call_count, 3)
+        self.assertEqual(provider.prepare_cleanup.call_count, 3)
+        provider.cleanup_artifacts.assert_called_once_with(
+            project_id="17",
+            issue_ids=[1],
+            merge_request_ids=[2],
+            branch_snapshots=[
+                {"name": "issue/1-smoke", "commitSha": "a" * 40},
+            ],
+            on_result=mock.ANY,
+        )
         self.assertIn("Cleanup applied in group/project", stdout.getvalue())
+
+    def test_cmd_cleanup_artifacts_rejects_branch_tip_change_since_preview(self):
+        args = argparse.Namespace(
+            provider="gitlab",
+            repo="group/project",
+            issues=[],
+            merge_requests=[],
+            branches=["issue/1-smoke"],
+            dry_run=False,
+            apply=None,
+        )
+        provider = mock.Mock()
+        provider.prepare_cleanup.side_effect = [
+            {
+                "projectId": "17",
+                "branchSnapshots": [
+                    {"name": "issue/1-smoke", "commitSha": "a" * 40},
+                ],
+            },
+            {
+                "projectId": "17",
+                "branchSnapshots": [
+                    {"name": "issue/1-smoke", "commitSha": "b" * 40},
+                ],
+            },
+        ]
+        provider_factory = mock.Mock(return_value=provider)
+
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=provider_factory,
+            )
+        args.apply = plan_id_from_preview(preview_stdout.getvalue())
+
+        with self.assertRaisesRegex(CliError, "does not match"):
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=provider_factory,
+            )
+
+        provider.cleanup_artifacts.assert_not_called()
+
+    def test_cmd_cleanup_artifacts_reports_partial_success_before_failure(self):
+        args = argparse.Namespace(
+            provider="gitlab",
+            repo="group/project",
+            issues=[1, 2],
+            merge_requests=[],
+            branches=[],
+            dry_run=False,
+            apply=None,
+        )
+        provider = mock.Mock()
+        provider.prepare_cleanup.return_value = {
+            "projectId": "17",
+            "branchSnapshots": [],
+        }
+
+        def fail_after_first_issue(
+            *, project_id, issue_ids, merge_request_ids, branch_snapshots, on_result
+        ):
+            self.assertEqual(project_id, "17")
+            self.assertEqual(branch_snapshots, [])
+            on_result("issue", issue_ids[0], "closed")
+            raise CliError("ERROR: closing issue 2 failed")
+
+        provider.cleanup_artifacts.side_effect = fail_after_first_issue
+        provider_factory = mock.Mock(return_value=provider)
+
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_cleanup_artifacts(
+                args,
+                token="token",
+                cleanup_provider_factory=provider_factory,
+            )
+        args.apply = plan_id_from_preview(preview_stdout.getvalue())
+
+        with contextlib.redirect_stdout(io.StringIO()) as progress_stdout:
+            with self.assertRaisesRegex(CliError, "issue 2 failed"):
+                work_item_commands.cmd_cleanup_artifacts(
+                    args,
+                    token="token",
+                    cleanup_provider_factory=provider_factory,
+                )
+
+        self.assertIn("Cleanup progress in group/project", progress_stdout.getvalue())
+        self.assertIn("Issue  1 -> closed", progress_stdout.getvalue())
+        self.assertNotIn("Cleanup applied", progress_stdout.getvalue())
 
     def test_cmd_attachments_json_uses_evidence_provider(self):
         args = argparse.Namespace(
@@ -669,9 +969,19 @@ class WorkItemTests(unittest.TestCase):
         self.assertEqual(rendered["groups"][0]["ids"], [1])
 
     def test_cmd_start_defaults_to_plan_without_transition(self):
-        args = argparse.Namespace(id=135821, branch=None, apply=False)
+        args = argparse.Namespace(
+            id=135821,
+            branch=None,
+            apply=None,
+            json=False,
+            provider="azure-devops",
+            repo=None,
+        )
         provider = mock.Mock()
         provider.get_start_work_plan.return_value = start_work_plan_fixture()
+        provider.prepare_work_item_transition.return_value = transition_preview_fixture(
+            state="In Progress"
+        )
         cmd_show = mock.Mock()
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -682,13 +992,14 @@ class WorkItemTests(unittest.TestCase):
                 cmd_show_func=cmd_show,
             )
 
-        provider.transition_work_item.assert_not_called()
+        provider.apply_prepared_work_item_transition.assert_not_called()
         cmd_show.assert_called_once_with(args, "token")
         self.assertIn("fix/135821-fix-global-filters", stdout.getvalue())
         self.assertIn("Preview only", stdout.getvalue())
+        self.assertRegex(stdout.getvalue(), r"Plan ID : sha256:[0-9a-f]{64}")
 
     def test_cmd_testing_requires_qa_email(self):
-        args = argparse.Namespace(id=135821, qa=None)
+        args = argparse.Namespace(id=135821, qa=None, apply=None)
 
         with mock.patch.object(work_item_commands, "QA_EMAIL", ""):
             with self.assertRaises(CliError) as exc:
@@ -702,9 +1013,37 @@ class WorkItemTests(unittest.TestCase):
         self.assertIn("No QA email set", str(exc.exception))
 
     def test_cmd_review_uses_work_tracking_provider_transition(self):
-        args = argparse.Namespace(id=135821, apply=True)
+        args = argparse.Namespace(
+            id=135821,
+            apply=None,
+            provider="azure-devops",
+            repo=None,
+            json=False,
+        )
         provider = mock.Mock()
+        transition_preview = transition_preview_fixture(state="In Review")
+        provider.prepare_work_item_transition.return_value = transition_preview
+        provider.apply_prepared_work_item_transition.return_value = "In Review"
 
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_review(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+        approved_plan_id = plan_id_from_preview(preview_stdout.getvalue())
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(CliError, "does not match"):
+            work_item_commands.cmd_review(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = approved_plan_id
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             work_item_commands.cmd_review(
                 args,
@@ -712,12 +1051,21 @@ class WorkItemTests(unittest.TestCase):
                 build_work_tracking_provider_func=lambda _token: provider,
             )
 
-        provider.transition_work_item.assert_called_once_with(item_id=135821, state="In Review")
+        provider.apply_prepared_work_item_transition.assert_called_once_with(transition_preview)
         self.assertIn("moved to 'In Review'", stdout.getvalue())
 
     def test_cmd_review_defaults_to_plan_without_transition(self):
-        args = argparse.Namespace(id=135821, apply=False)
+        args = argparse.Namespace(
+            id=135821,
+            apply=None,
+            provider="azure-devops",
+            repo=None,
+            json=False,
+        )
         provider = mock.Mock()
+        provider.prepare_work_item_transition.return_value = transition_preview_fixture(
+            state="In Review"
+        )
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             work_item_commands.cmd_review(
@@ -726,14 +1074,51 @@ class WorkItemTests(unittest.TestCase):
                 build_work_tracking_provider_func=lambda _token: provider,
             )
 
-        provider.transition_work_item.assert_not_called()
-        self.assertIn("Plan: move work item 135821", stdout.getvalue())
+        provider.apply_prepared_work_item_transition.assert_not_called()
+        self.assertIn("Action  : work-item.review", stdout.getvalue())
+        self.assertIn('"workItemId": 135821', stdout.getvalue())
+        self.assertIn('"state": "In Review"', stdout.getvalue())
+        self.assertIn('"method": "PATCH"', stdout.getvalue())
         self.assertIn("Preview only", stdout.getvalue())
 
     def test_cmd_testing_uses_work_tracking_provider_transition(self):
-        args = argparse.Namespace(id=135821, qa="qa@example.com")
+        args = argparse.Namespace(
+            id=135821,
+            qa="qa@example.com",
+            apply=None,
+            provider="azure-devops",
+            repo=None,
+            json=False,
+        )
         provider = mock.Mock()
+        transition_preview = transition_preview_fixture(
+            state="In Testing",
+            assignee="qa@example.com",
+        )
+        provider.prepare_work_item_transition.return_value = transition_preview
+        provider.apply_prepared_work_item_transition.return_value = "In Testing"
 
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_testing(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+                qa_email="fallback@example.com",
+            )
+        approved_plan_id = plan_id_from_preview(preview_stdout.getvalue())
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(CliError, "does not match"):
+            work_item_commands.cmd_testing(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+                qa_email="fallback@example.com",
+            )
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = approved_plan_id
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             work_item_commands.cmd_testing(
                 args,
@@ -742,12 +1127,61 @@ class WorkItemTests(unittest.TestCase):
                 qa_email="fallback@example.com",
             )
 
-        provider.transition_work_item.assert_called_once_with(
-            item_id=135821,
+        provider.apply_prepared_work_item_transition.assert_called_once_with(transition_preview)
+        self.assertIn("assigned to qa@example.com", stdout.getvalue())
+
+    def test_cmd_handoff_to_qa_preserves_preview_and_exact_plan_approval(self):
+        args = argparse.Namespace(
+            id=135821,
+            qa="qa@example.com",
+            apply=None,
+            provider="azure-devops",
+            repo=None,
+            json=False,
+        )
+        provider = mock.Mock()
+        transition_preview = transition_preview_fixture(
             state="In Testing",
             assignee="qa@example.com",
         )
-        self.assertIn("assigned to qa@example.com", stdout.getvalue())
+        provider.prepare_work_item_transition.return_value = transition_preview
+        provider.apply_prepared_work_item_transition.return_value = "In Testing"
+
+        def testing_command(delegated_args, delegated_token):
+            return work_item_commands.cmd_testing(
+                delegated_args,
+                delegated_token,
+                build_work_tracking_provider_func=lambda _token: provider,
+                qa_email="fallback@example.com",
+            )
+
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_handoff_to_qa(
+                args,
+                token="token",
+                cmd_testing_func=testing_command,
+            )
+        approved_plan_id = plan_id_from_preview(preview_stdout.getvalue())
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(CliError, "does not match"):
+            work_item_commands.cmd_handoff_to_qa(
+                args,
+                token="token",
+                cmd_testing_func=testing_command,
+            )
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = approved_plan_id
+        with contextlib.redirect_stdout(io.StringIO()):
+            work_item_commands.cmd_handoff_to_qa(
+                args,
+                token="token",
+                cmd_testing_func=testing_command,
+            )
+
+        provider.apply_prepared_work_item_transition.assert_called_once_with(transition_preview)
 
     def test_cmd_attachments_json_includes_download_results_from_provider(self):
         args = argparse.Namespace(
@@ -893,10 +1327,36 @@ class WorkItemTests(unittest.TestCase):
         provider.get_triage_report.assert_called_once_with(item_ids=[316043, 316044])
 
     def test_cmd_comment_uses_work_tracking_provider(self):
-        args = argparse.Namespace(id=135821, text="Please add repro details.", apply=True)
+        args = argparse.Namespace(
+            id=135821,
+            text="Please add repro details.",
+            apply=None,
+            provider="azure-devops",
+            repo=None,
+            json=False,
+        )
         provider = mock.Mock()
         provider.add_work_item_comment.return_value = 5889999
 
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_comment(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+        approved_plan_id = plan_id_from_preview(preview_stdout.getvalue())
+        provider.add_work_item_comment.assert_not_called()
+
+        args.apply = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(CliError, "does not match"):
+            work_item_commands.cmd_comment(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+        provider.add_work_item_comment.assert_not_called()
+
+        args.apply = approved_plan_id
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             work_item_commands.cmd_comment(
                 args,
@@ -911,7 +1371,14 @@ class WorkItemTests(unittest.TestCase):
         self.assertIn("comment id: 5889999", stdout.getvalue())
 
     def test_cmd_comment_defaults_to_plan_without_posting(self):
-        args = argparse.Namespace(id=135821, text="Please add repro details.", apply=False)
+        args = argparse.Namespace(
+            id=135821,
+            text="Please add repro details.",
+            apply=None,
+            provider="azure-devops",
+            repo=None,
+            json=False,
+        )
         provider = mock.Mock()
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -1037,6 +1504,110 @@ class WorkItemTests(unittest.TestCase):
         self.assertEqual(shown_args.command, "show")
         self.assertEqual(shown_args.provider, "azure-devops")
         self.assertIn("Next candidate in Sprint 26", stdout.getvalue())
+
+    def test_cmd_pick_next_delegates_preview_and_exact_start_plan_approval(self):
+        args = argparse.Namespace(start=True, branch=None, apply=None)
+        provider = mock.Mock()
+        provider.get_open_candidate_items.return_value = (
+            workflow_models.Sprint(
+                id="sprint-1",
+                name="Sprint 26",
+                path="Example\\Sprint 26",
+                start_date="2026-07-21",
+                finish_date="2026-08-03",
+            ),
+            [
+                workflow_models.CandidateWorkItem(
+                    id=135821,
+                    kind="Bug",
+                    state="Ready for development",
+                    title="Fix global filters",
+                )
+            ],
+        )
+        provider.get_start_work_plan.return_value = start_work_plan_fixture()
+        transition_preview = transition_preview_fixture(state="In Progress")
+        provider.prepare_work_item_transition.return_value = transition_preview
+        provider.apply_prepared_work_item_transition.return_value = "In Progress"
+        cmd_show = mock.Mock()
+
+        def start_command(delegated_args, delegated_token):
+            self.assertEqual(delegated_args.id, 135821)
+            self.assertFalse(delegated_args.json)
+            return work_item_commands.cmd_start(
+                delegated_args,
+                delegated_token,
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_pick_next(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+                cmd_show_func=cmd_show,
+                cmd_start_func=start_command,
+            )
+        approved_plan_id = plan_id_from_preview(preview_stdout.getvalue())
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = "sha256:" + "0" * 64
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(CliError, "does not match"):
+                work_item_commands.cmd_pick_next(
+                    args,
+                    token="token",
+                    build_work_tracking_provider_func=lambda _token: provider,
+                    cmd_show_func=cmd_show,
+                    cmd_start_func=start_command,
+                )
+        provider.apply_prepared_work_item_transition.assert_not_called()
+
+        args.apply = approved_plan_id
+        with contextlib.redirect_stdout(io.StringIO()):
+            work_item_commands.cmd_pick_next(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+                cmd_show_func=cmd_show,
+                cmd_start_func=start_command,
+            )
+
+        provider.apply_prepared_work_item_transition.assert_called_once_with(transition_preview)
+
+    def test_cmd_pick_next_rejects_apply_without_start(self):
+        args = argparse.Namespace(
+            start=False,
+            branch=None,
+            apply="sha256:" + "0" * 64,
+        )
+        provider = mock.Mock()
+        provider.get_open_candidate_items.return_value = (
+            workflow_models.Sprint(
+                id="sprint-1",
+                name="Sprint 26",
+                path="Example\\Sprint 26",
+                start_date="2026-07-21",
+                finish_date="2026-08-03",
+            ),
+            [
+                workflow_models.CandidateWorkItem(
+                    id=135821,
+                    kind="Bug",
+                    state="Ready for development",
+                    title="Fix global filters",
+                )
+            ],
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(CliError, "--apply requires --start"):
+                work_item_commands.cmd_pick_next(
+                    args,
+                    token="token",
+                    build_work_tracking_provider_func=lambda _token: provider,
+                    cmd_show_func=mock.Mock(),
+                )
 
     def test_cmd_comments_shows_latest_requested_comments(self):
         args = argparse.Namespace(id=310818, latest=2, json=False)

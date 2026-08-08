@@ -11,5 +11,7 @@ export AZURE_DEVOPS_QA_USER="qa@example.com"
 # export AZURE_DEVOPS_DEFAULT_REPO="your-repo-name"
 # export AZURE_DEVOPS_API_VERSION="7.1"
 # export AZURE_DEVOPS_RESOURCE="499b84ac-1321-427f-aa17-267ca6975798"
+# Off-origin work-item media is blocked by default. Allow only exact public HTTPS origins.
+# export AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS="https://media.example.com,https://cdn.example.com"
 # export GITLAB_TOKEN="glpat-..."
 # export GITLAB_BASE_URL="https://gitlab.com"

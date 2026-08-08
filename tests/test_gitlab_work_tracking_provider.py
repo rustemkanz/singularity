@@ -69,7 +69,9 @@ class GitLabWorkTrackingProviderTests(unittest.TestCase):
         provider = GitLabWorkTrackingProvider("token", "group/project")
         issue = {
             "iid": 17,
+            "state": "opened",
             "labels": ["bug", "sg:state:in-progress"],
+            "updated_at": "2026-08-08T10:00:00Z",
         }
         updated_issue = {
             "iid": 17,
@@ -78,10 +80,30 @@ class GitLabWorkTrackingProviderTests(unittest.TestCase):
         }
 
         with mock.patch.object(provider, "_fetch_issue", return_value=issue):
+            preview = provider.prepare_work_item_transition(
+                item_id=17,
+                state="In Testing",
+                assignee="qa-user",
+            )
             with mock.patch.object(provider, "_request_json", return_value=updated_issue) as request_json:
-                actual_state = provider.transition_work_item(item_id=17, state="In Testing", assignee="qa-user")
+                actual_state = provider.apply_prepared_work_item_transition(preview)
 
         self.assertEqual(actual_state, "In Testing")
+        self.assertEqual(
+            preview.current_snapshot,
+            {
+                "state": "In Progress",
+                "labels": ["bug", "sg:state:in-progress"],
+                "updatedAt": "2026-08-08T10:00:00Z",
+            },
+        )
+        self.assertEqual(
+            preview.request["formData"],
+            {
+                "labels": "bug,sg:state:in-testing",
+                "assignee_username": "qa-user",
+            },
+        )
         request_json.assert_called_once_with(
             "https://gitlab.com",
             "/projects/group%2Fproject/issues/17",
@@ -92,11 +114,34 @@ class GitLabWorkTrackingProviderTests(unittest.TestCase):
             },
         )
 
+    def test_apply_prepared_transition_rejects_changed_issue_snapshot(self):
+        provider = GitLabWorkTrackingProvider("token", "group/project")
+        original_issue = {
+            "iid": 17,
+            "state": "opened",
+            "labels": ["bug", "sg:state:in-progress"],
+            "updated_at": "2026-08-08T10:00:00Z",
+        }
+        changed_issue = {
+            **original_issue,
+            "labels": ["bug", "urgent", "sg:state:in-progress"],
+            "updated_at": "2026-08-08T10:01:00Z",
+        }
+
+        with mock.patch.object(provider, "_fetch_issue", side_effect=[original_issue, changed_issue]):
+            preview = provider.prepare_work_item_transition(item_id=17, state="In Review")
+            with mock.patch.object(provider, "_request_json") as request_json:
+                with self.assertRaisesRegex(CliError, "changed since the transition preview"):
+                    provider.apply_prepared_work_item_transition(preview)
+
+        request_json.assert_not_called()
+
     def test_transition_work_item_rejects_unsupported_state(self):
         provider = GitLabWorkTrackingProvider("token", "group/project")
 
-        with self.assertRaises(CliError):
-            provider.transition_work_item(item_id=17, state="Done")
+        with mock.patch.object(provider, "_fetch_issue", return_value={"iid": 17, "labels": []}):
+            with self.assertRaises(CliError):
+                provider.prepare_work_item_transition(item_id=17, state="Done")
 
     def test_get_work_item_context_prefers_helper_workflow_label_for_state(self):
         provider = GitLabWorkTrackingProvider("token", "group/project")

@@ -139,7 +139,7 @@ flowchart TD
 
   Start with internal models that preserve current behavior while reducing Azure DevOps-specific coupling.
 
-  The first low-risk slice is the start-work planning flow:
+  The first low-risk slice was the canonical start planning flow:
 
   - normalize the work-item fields needed to propose a branch and change-request draft
   - keep the existing CLI output stable
@@ -149,11 +149,11 @@ flowchart TD
 
   Current implemented slices:
 
-  - start-work planning through `TrackedWorkItem` and `StartWorkPlan`
+  - start planning through `TrackedWorkItem` and `StartWorkPlan`
   - read-only work-item inspection through a concrete `WorkTrackingProvider` adapter boundary
   - work-item state transitions through the same `WorkTrackingProvider` adapter boundary
   - sprint lookup, ready-item candidate lookup, triage reporting, and work-item comment posting through the same `WorkTrackingProvider` adapter boundary
-  - repository listing and change-request creation/prepare-review through the PR-side provider boundary
+  - repository listing and change-request planning/creation through the PR-side provider boundary
   - PR summary/status/reviewer inspection through `ChangeRequest` and a concrete `ReviewProvider` adapter boundary
   - PR review-thread inspection through `ReviewThread` and `ReviewComment`
   - PR thread comment, inline comment, reply, edit, and resolve mutations through the same `ReviewProvider` adapter boundary
@@ -161,6 +161,7 @@ flowchart TD
   - build queueing and pending approval actions through the same `BuildProvider` adapter boundary
   - attachment and screenshot inspection/download through a concrete `EvidenceProvider` adapter boundary
   - work-item summary/comment/development-link shaping through workflow models behind the existing CLI output
+  - every external mutation through immutable `MutationPlan` envelopes and Git-worktree-identity-bound, short-lived, one-shot SHA-256 approval IDs
 
   Current adapter placement:
 
@@ -175,7 +176,8 @@ flowchart TD
   - Azure-specific transport and Azure CLI token acquisition now also live under `providers/azure_devops/`
   - the Azure DevOps helper implementations for pull requests, work items, and work-item context now live under `providers/azure_devops/`, and internal imports use those paths directly
   - provider-neutral runtime helpers now use names like `app_config.py` and `git_client.py` instead of `ado_` prefixes
-  - `sg.py` still owns CLI parsing and command orchestration, but the read-only work-item inspection, start-work/state-transition, attachment inspection, PR inspection, and build inspection slices no longer fetch Azure DevOps data directly
+  - `sg.py` still owns CLI parsing and command orchestration, but the read-only work-item inspection, start/state-transition, attachment inspection, PR inspection, and build inspection slices no longer fetch Azure DevOps data directly
+  - `mutation_plans.py` owns canonical mutation envelopes, nonce-backed Plan IDs, payload-free local pending/used approval records, preview rendering, and exact one-shot apply validation
 
 ## Keep, generalize, or move
 
@@ -303,7 +305,7 @@ Current first step on that boundary:
 
 - Do not remove the CLI in favor of MCP.
 - Do not try to generalize to every work-management platform before the internal boundaries are cleaner.
-- Do not add an always-on autonomous runtime until the approval model is explicit.
+- Do not add an always-on autonomous runtime that bypasses the immutable preview/approval contract.
 
 ## What an MCP phase would look like
 

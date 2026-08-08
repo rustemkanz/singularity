@@ -1,11 +1,16 @@
 from __future__ import annotations
-
+import copy
 import urllib.parse
 
 from errors import CliError
 from providers.azure_devops import work_items as azure_devops_work_items
 from providers.gitlab.review_provider import GitLabReviewProvider
-from providers.interfaces import WorkItemCommentsSnapshot, WorkItemContextSnapshot, WorkTrackingProvider
+from providers.interfaces import (
+    WorkItemCommentsSnapshot,
+    WorkItemContextSnapshot,
+    WorkItemTransitionPreview,
+    WorkTrackingProvider,
+)
 from workflow_models import (
     CandidateWorkItem,
     Sprint,
@@ -42,6 +47,14 @@ def _issue_state(issue: dict) -> str:
 def _issue_kind(issue: dict) -> str:
     issue_type = issue.get("issue_type") or issue.get("type") or "issue"
     return str(issue_type).replace("_", " ").title()
+
+
+def _transition_snapshot(issue: dict) -> dict:
+    return {
+        "state": _gitlab_workflow_state(issue),
+        "labels": list(issue.get("labels") or []),
+        "updatedAt": issue.get("updated_at"),
+    }
 
 
 def _work_item_summary(issue: dict) -> WorkItemSummary:
@@ -215,7 +228,13 @@ class GitLabWorkTrackingProvider(GitLabReviewProvider, WorkTrackingProvider):
             ],
         )
 
-    def transition_work_item(self, *, item_id: int, state: str, assignee: str | None = None) -> str:
+    def prepare_work_item_transition(
+        self,
+        *,
+        item_id: int,
+        state: str,
+        assignee: str | None = None,
+    ) -> WorkItemTransitionPreview:
         issue = self._fetch_issue(item_id)
         form_data = {
             "labels": ",".join(self._build_transition_labels(list(issue.get("labels") or []), state)),
@@ -223,13 +242,51 @@ class GitLabWorkTrackingProvider(GitLabReviewProvider, WorkTrackingProvider):
         if assignee:
             form_data["assignee_username"] = assignee
 
+        return WorkItemTransitionPreview(
+            provider="gitlab",
+            item_id=item_id,
+            requested_state=state,
+            concrete_state=state,
+            current_snapshot=_transition_snapshot(issue),
+            request={
+                "method": "PUT",
+                "formData": form_data,
+            },
+        )
+
+    def apply_prepared_work_item_transition(self, preview: WorkItemTransitionPreview) -> str:
+        if preview.provider != "gitlab":
+            raise CliError(
+                f"ERROR: Cannot apply a {preview.provider!r} transition with the GitLab provider."
+            )
+        if preview.request.get("method") != "PUT":
+            raise CliError("ERROR: Prepared GitLab transition does not contain a PUT request.")
+        form_data = preview.request.get("formData")
+        if not isinstance(form_data, dict):
+            raise CliError("ERROR: Prepared GitLab transition does not contain form data.")
+
+        current_issue = self._fetch_issue(preview.item_id)
+        if _transition_snapshot(current_issue) != preview.current_snapshot:
+            raise CliError(
+                f"ERROR: GitLab issue {preview.item_id} changed since the transition preview; "
+                "generate and approve a fresh plan."
+            )
+
         updated_issue = self._request_json(
             self._base_url_for_work_tracking(),
-            self._issue_path(item_id),
+            self._issue_path(preview.item_id),
             method="PUT",
-            form_data=form_data,
+            form_data=copy.deepcopy(form_data),
         )
         return _gitlab_workflow_state(updated_issue)
+
+    def transition_work_item(self, *, item_id: int, state: str, assignee: str | None = None) -> str:
+        preview = self.prepare_work_item_transition(
+            item_id=item_id,
+            state=state,
+            assignee=assignee,
+        )
+        return self.apply_prepared_work_item_transition(preview)
 
     def get_triage_report(self, *, item_ids: list[int]) -> TriageReport:
         raise CliError("ERROR: GitLab issue commands do not support triage yet.")

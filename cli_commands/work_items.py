@@ -3,13 +3,55 @@ import json
 import os
 
 from errors import CliError
-from app_config import ME, QA_EMAIL
+from app_config import GITLAB_BASE_URL, ME, ORG, PROJECT, QA_EMAIL
+from mutation_plans import MutationPlan, render_plan_preview, require_approved_plan
 
 
 def _require_provider(factory, provider_label: str):
     if factory is None:
         raise RuntimeError(f"Missing {provider_label} provider factory.")
     return factory
+
+
+def _work_item_target(args, *, item_id: int | None = None) -> dict:
+    provider = getattr(args, "provider", "azure-devops")
+    if provider == "gitlab":
+        target = {
+            "provider": "gitlab",
+            "baseUrl": GITLAB_BASE_URL,
+            "project": getattr(args, "repo", None),
+        }
+    else:
+        target = {
+            "provider": "azure-devops",
+            "organization": ORG,
+            "project": PROJECT,
+        }
+    if item_id is not None:
+        target["workItemId"] = item_id
+    return target
+
+
+def _preview_or_apply(args, plan: MutationPlan) -> bool:
+    should_apply = require_approved_plan(plan, getattr(args, "apply", None))
+    if not should_apply:
+        print(render_plan_preview(plan, json_output=getattr(args, "json", False)))
+    return should_apply
+
+
+def _add_apply_plan_argument(parser, *, include_dry_run: bool = False) -> None:
+    mode = parser.add_mutually_exclusive_group() if include_dry_run else parser
+    mode.add_argument(
+        "--apply",
+        metavar="PLAN_ID",
+        help="Apply only the exact previewed plan identified by PLAN_ID",
+    )
+    if include_dry_run:
+        mode.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Explicitly preview without applying (the default; retained for compatibility)",
+        )
 
 
 def _reference_flag(reference: dict, snake_case_name: str, camel_case_name: str) -> bool:
@@ -453,29 +495,43 @@ def _print_start_work_plan(plan, *, branch_name: str | None = None) -> None:
     print()
 
 
-def cmd_start_work(args, token, *, build_work_tracking_provider_func=None):
-    provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
-    plan = provider.get_start_work_plan(item_id=args.id)
-    if args.json:
-        print(json.dumps(plan.to_legacy_dict(), indent=2))
-        return
-
-    _print_start_work_plan(plan)
-
-
 def cmd_start(args, token, *, build_work_tracking_provider_func=None, cmd_show_func=None):
-    if cmd_show_func is not None:
+    if cmd_show_func is not None and not getattr(args, "json", False):
         cmd_show_func(args, token)
     provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
-    plan = provider.get_start_work_plan(item_id=args.id)
-    _print_start_work_plan(plan, branch_name=getattr(args, "branch", None))
+    start_work_plan = provider.get_start_work_plan(item_id=args.id)
+    start_work_payload = _start_work_plan_payload(
+        start_work_plan,
+        branch_name=getattr(args, "branch", None),
+    )
+    transition_preview = provider.prepare_work_item_transition(
+        item_id=args.id,
+        state="In Progress",
+    )
+    mutation_plan = MutationPlan(
+        action="work-item.start",
+        target=_work_item_target(args, item_id=args.id),
+        payload={
+            "state": "In Progress",
+            "startWorkPlan": start_work_payload,
+            "transition": transition_preview.to_plan_payload(),
+        },
+    )
+    if not getattr(args, "json", False):
+        _print_start_work_plan(start_work_plan, branch_name=getattr(args, "branch", None))
 
-    if not getattr(args, "apply", False):
-        print("Preview only: no work-item state was changed. Re-run with --apply after approval.\n")
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    actual_state = provider.transition_work_item(item_id=args.id, state="In Progress")
+    actual_state = provider.apply_prepared_work_item_transition(transition_preview)
     rendered_state = actual_state if isinstance(actual_state, str) and actual_state else "In Progress"
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "appliedPlanId": args.apply,
+            "workItemId": args.id,
+            "state": rendered_state,
+        }, indent=2))
+        return
     print(f"✓ Work item {args.id} moved to '{rendered_state}'.")
 
 
@@ -521,24 +577,35 @@ def cmd_pick_next(
                 provider="azure-devops",
                 repo=None,
                 branch=args.branch,
-                apply=getattr(args, "apply", False),
+                apply=getattr(args, "apply", None),
+                json=False,
             ),
             token,
         )
     else:
-        if getattr(args, "apply", False):
+        if getattr(args, "apply", None) is not None:
             raise CliError("ERROR: --apply requires --start for pick-next.")
-        print("Use '--start' to preview the start plan; add '--apply' after approval to move it to 'In Progress'.\n")
+        print("Use '--start' to preview the start plan; then approve its exact Plan ID to move it to 'In Progress'.\n")
 
 
 def cmd_review(args, token, *, build_work_tracking_provider_func=None):
-    if not getattr(args, "apply", False):
-        print(f"Plan: move work item {args.id} to 'In Review'.")
-        print("Preview only: no work-item state was changed. Re-run with --apply after approval.")
+    provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
+    transition_preview = provider.prepare_work_item_transition(
+        item_id=args.id,
+        state="In Review",
+    )
+    mutation_plan = MutationPlan(
+        action="work-item.review",
+        target=_work_item_target(args, item_id=args.id),
+        payload={
+            "state": "In Review",
+            "transition": transition_preview.to_plan_payload(),
+        },
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
-    provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
-    actual_state = provider.transition_work_item(item_id=args.id, state="In Review")
+    actual_state = provider.apply_prepared_work_item_transition(transition_preview)
     rendered_state = actual_state if isinstance(actual_state, str) and actual_state else "In Review"
     print(f"✓ Work item {args.id} moved to '{rendered_state}'.")
 
@@ -548,7 +615,24 @@ def cmd_testing(args, token, *, build_work_tracking_provider_func=None, qa_email
     if not qa:
         raise CliError("ERROR: No QA email set. Use --qa <email> or set QA_EMAIL in the script.")
     provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
-    actual_state = provider.transition_work_item(item_id=args.id, state="In Testing", assignee=qa)
+    transition_preview = provider.prepare_work_item_transition(
+        item_id=args.id,
+        state="In Testing",
+        assignee=qa,
+    )
+    mutation_plan = MutationPlan(
+        action="work-item.testing",
+        target=_work_item_target(args, item_id=args.id),
+        payload={
+            "state": "In Testing",
+            "assignee": qa,
+            "transition": transition_preview.to_plan_payload(),
+        },
+    )
+    if not _preview_or_apply(args, mutation_plan):
+        return
+
+    actual_state = provider.apply_prepared_work_item_transition(transition_preview)
     rendered_state = actual_state if isinstance(actual_state, str) and actual_state else "In Testing"
     print(f"✓ Work item {args.id} moved to '{rendered_state}' and assigned to {qa}.")
 
@@ -559,14 +643,19 @@ def cmd_handoff_to_qa(args, token, *, cmd_testing_func=None):
 
 
 def cmd_comment(args, token, *, build_work_tracking_provider_func=None):
-    if not getattr(args, "apply", False):
-        print("Plan: add a work-item comment")
-        print(json.dumps({"work_item": args.id, "text": args.text}, indent=2))
-        print("Preview only: no comment was added. Re-run with --apply after approval.")
+    mutation_plan = MutationPlan(
+        action="work-item.comment",
+        target=_work_item_target(args, item_id=args.id),
+        payload={"text": args.text},
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
     provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
-    comment_id = provider.add_work_item_comment(item_id=args.id, text=args.text)
+    comment_id = provider.add_work_item_comment(
+        item_id=mutation_plan.target["workItemId"],
+        text=mutation_plan.payload["text"],
+    )
     print(f"✓ Comment added to work item {args.id} (comment id: {comment_id}).")
 
 
@@ -624,56 +713,50 @@ def register_work_item_subcommands(sub):
 
     p = sub.add_parser("pick-next", help="Show the next best candidate item and optionally preview its start plan")
     p.add_argument("--start", action="store_true", help="Preview the selected item's start plan")
-    p.add_argument("--apply", action="store_true",
-                   help="With --start, move the selected item to 'In Progress' after showing the plan")
+    _add_apply_plan_argument(p)
     p.add_argument("--branch", "-b", metavar="NAME", help="Branch name to use when combined with --start")
 
-    p = sub.add_parser("start", help="Preview the plan to start an item; use --apply to change its state")
+    p = sub.add_parser("start", help="Preview the canonical start plan; apply it only by exact Plan ID")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--branch", "-b", metavar="NAME", help="Override the provider-suggested branch name")
-    p.add_argument("--apply", action="store_true",
-                   help="Move the item to 'In Progress' after showing its context and start plan")
-
-    p = sub.add_parser("start-work", help="Print the canonical start plan without changing state (supports --json)")
-    p.add_argument("id", type=int)
-    p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
-                   help="Work-tracking provider to use (default: azure-devops)")
-    p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
+    _add_apply_plan_argument(p)
 
-    p = sub.add_parser("review", help="Preview moving an item to 'In Review'; use --apply to change its state")
+    p = sub.add_parser("review", help="Preview moving an item to 'In Review'; apply only by exact Plan ID")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
-    p.add_argument("--apply", action="store_true", help="Move the item to 'In Review'")
+    _add_apply_plan_argument(p)
 
-    p = sub.add_parser("testing", help="Move item to 'In Testing' and assign to QA")
-    p.add_argument("id", type=int)
-    p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
-                   help="Work-tracking provider to use (default: azure-devops)")
-    p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
-    p.add_argument("--qa", metavar="ASSIGNEE", help="QA assignee identity (ADO email or GitLab username)")
-
-    p = sub.add_parser("handoff-to-qa", help="Alias for testing")
+    p = sub.add_parser("testing", help="Preview moving an item to 'In Testing' and assigning it to QA")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--qa", metavar="ASSIGNEE", help="QA assignee identity (ADO email or GitLab username)")
+    _add_apply_plan_argument(p)
 
-    p = sub.add_parser("comment", help="Preview a work-item comment; use --apply to post it")
+    p = sub.add_parser("handoff-to-qa", help="Alias for the plan-first testing command")
+    p.add_argument("id", type=int)
+    p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
+                   help="Work-tracking provider to use (default: azure-devops)")
+    p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
+    p.add_argument("--qa", metavar="ASSIGNEE", help="QA assignee identity (ADO email or GitLab username)")
+    _add_apply_plan_argument(p)
+
+    p = sub.add_parser("comment", help="Preview a work-item comment; post only by exact Plan ID")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("text", help="Comment text")
-    p.add_argument("--apply", action="store_true", help="Post the comment")
+    _add_apply_plan_argument(p)
 
-    p = sub.add_parser("cleanup-artifacts", help="Close disposable tracking/review artifacts and delete disposable branches")
+    p = sub.add_parser("cleanup-artifacts", help="Preview closing disposable artifacts and deleting remote branches")
     p.add_argument("--provider", choices=("gitlab",), required=True,
                    help="Cleanup provider to use")
     p.add_argument("--repo", required=True, metavar="REPO", help="GitLab project path or id")
@@ -683,7 +766,7 @@ def register_work_item_subcommands(sub):
                    help="GitLab merge request iid to close (repeatable)")
     p.add_argument("--branch", dest="branches", action="append", default=[], metavar="NAME",
                    help="GitLab branch name to delete (repeatable)")
-    p.add_argument("--dry-run", action="store_true", help="Print the cleanup plan instead of applying it")
+    _add_apply_plan_argument(p, include_dry_run=True)
 
 
 def work_item_command_handlers() -> dict[str, callable]:
@@ -700,7 +783,6 @@ def work_item_command_handlers() -> dict[str, callable]:
         "introduced-by": cmd_introduced_by,
         "triage": cmd_triage,
         "start": cmd_start,
-        "start-work": cmd_start_work,
         "review": cmd_review,
         "testing": cmd_testing,
         "handoff-to-qa": cmd_handoff_to_qa,
@@ -710,29 +792,54 @@ def work_item_command_handlers() -> dict[str, callable]:
 
 
 def cmd_cleanup_artifacts(args, token, *, cleanup_provider_factory=None):
-    provider_factory = cleanup_provider_factory or _require_provider
-    provider = provider_factory(token)
-    plan = {
+    if not args.issues and not args.merge_requests and not args.branches:
+        raise CliError("ERROR: cleanup-artifacts requires at least one --issue, --mr, or --branch target.")
+    provider = _require_provider(cleanup_provider_factory, "cleanup")(token)
+    prepared_cleanup = provider.prepare_cleanup(branches=list(args.branches))
+    target = _work_item_target(args)
+    target["projectId"] = prepared_cleanup["projectId"]
+    payload = {
         "provider": args.provider,
         "repo": args.repo,
         "issues": list(args.issues),
         "mergeRequests": list(args.merge_requests),
-        "branches": list(args.branches),
+        "branches": list(prepared_cleanup["branchSnapshots"]),
     }
-    if args.dry_run:
-        print("Dry run: cleanup artifacts payload")
-        print(json.dumps(plan, indent=2))
+    mutation_plan = MutationPlan(
+        action="artifacts.cleanup",
+        target=target,
+        payload=payload,
+    )
+    if not _preview_or_apply(args, mutation_plan):
         return
 
+    reported: set[tuple[str, object, str]] = set()
+
+    def report_result(kind: str, identifier, state: str) -> None:
+        result_key = (kind, identifier, state)
+        if result_key in reported:
+            return
+        if not reported:
+            print(f"Cleanup progress in {args.repo}:")
+        reported.add(result_key)
+        if kind == "issue":
+            print(f"  Issue  {identifier} -> {state}")
+        elif kind == "mergeRequest":
+            print(f"  MR     {identifier} -> {state}")
+        elif kind == "branch":
+            print(f"  Branch deleted: {identifier}")
+
     results = provider.cleanup_artifacts(
-        issue_ids=list(args.issues),
-        merge_request_ids=list(args.merge_requests),
-        branches=list(args.branches),
+        project_id=mutation_plan.target["projectId"],
+        issue_ids=list(mutation_plan.payload["issues"]),
+        merge_request_ids=list(mutation_plan.payload["mergeRequests"]),
+        branch_snapshots=list(mutation_plan.payload["branches"]),
+        on_result=report_result,
     )
-    print(f"✓ Cleanup applied in {args.repo}.")
     for issue_id, state in results.get("issues", []):
-        print(f"  Issue  {issue_id} -> {state}")
+        report_result("issue", issue_id, state)
     for merge_request_id, state in results.get("mergeRequests", []):
-        print(f"  MR     {merge_request_id} -> {state}")
+        report_result("mergeRequest", merge_request_id, state)
     for branch in results.get("branches", []):
-        print(f"  Branch deleted: {branch}")
+        report_result("branch", branch, "deleted")
+    print(f"✓ Cleanup applied in {args.repo}.")

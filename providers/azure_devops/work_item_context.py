@@ -1,14 +1,29 @@
+import http.client
+import ipaddress
 import mimetypes
 import os
+import queue
 import re
+import socket
 import shutil
 import subprocess
+import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from html import unescape
 from html.parser import HTMLParser
 
-from app_config import API_VER, BASE_URL, OPENER, ORG, PROJECT
+from app_config import (
+    API_VER,
+    AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS,
+    BASE_URL,
+    ORG,
+    PROJECT,
+    SSL_CTX,
+    normalize_https_origin,
+)
 from errors import CliError
 from providers.azure_devops.http import api, api_with_headers
 from providers.azure_devops.pull_requests import pr_browser_url, project_base_url, short_branch_name
@@ -31,6 +46,13 @@ from workflow_models import (
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
 DOWNLOAD_TIMEOUT_SECONDS = 30
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+MAX_DOWNLOAD_REFERENCES = 50
+MAX_TOTAL_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_VALIDATED_ADDRESS_ATTEMPTS = 16
+MAX_TOTAL_DOWNLOAD_SECONDS = 120
+MAX_DOWNLOAD_REDIRECTS = 5
+DOWNLOAD_READ_CHUNK_BYTES = 64 * 1024
+DOWNLOAD_REDIRECT_STATUS_CODES = frozenset((301, 302, 303, 307, 308))
 IMAGE_URL_PATTERN = re.compile(
     r"https?://[^\"'\s>]+?(?:\.png|\.jpg|\.jpeg|\.gif|\.webp|\.bmp|\.svg)(?:\?[^\"'\s>]*)?",
     re.IGNORECASE,
@@ -45,6 +67,88 @@ WORK_ITEM_RELATION_GROUPS = {
     "System.LinkTypes.Hierarchy-Forward": "children",
     "System.LinkTypes.Related": "related",
 }
+
+
+class NoDownloadRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Expose redirects to the caller so every destination can be validated."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+DOWNLOAD_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=SSL_CTX),
+    NoDownloadRedirectHandler(),
+)
+DEFAULT_DOWNLOAD_OPENER = DOWNLOAD_OPENER
+
+
+class DownloadLimitError(ValueError):
+    """Raised when a shared media-download safety budget is exhausted."""
+
+
+class DownloadBudget:
+    """Shared byte, connection-attempt, and wall-clock budget for one operation."""
+
+    def __init__(
+        self,
+        *,
+        max_total_bytes: int = MAX_TOTAL_DOWNLOAD_BYTES,
+        max_address_attempts: int = MAX_VALIDATED_ADDRESS_ATTEMPTS,
+        max_total_seconds: float = MAX_TOTAL_DOWNLOAD_SECONDS,
+        clock=None,
+    ):
+        self.max_total_bytes = max_total_bytes
+        self.max_address_attempts = max_address_attempts
+        self.clock = time.monotonic if clock is None else clock
+        self.deadline = self.clock() + max_total_seconds
+        self.bytes_received = 0
+        self.address_attempts = 0
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, self.max_total_bytes - self.bytes_received)
+
+    def remaining_timeout(self) -> float:
+        remaining = self.deadline - self.clock()
+        if remaining <= 0:
+            raise DownloadLimitError("Media download exceeded the total wall-clock time limit.")
+        return min(float(DOWNLOAD_TIMEOUT_SECONDS), remaining)
+
+    def record_bytes(self, size: int) -> None:
+        if size < 0 or size > self.remaining_bytes:
+            self.bytes_received = self.max_total_bytes
+            raise DownloadLimitError(
+                f"Media downloads exceed the {self.max_total_bytes}-byte aggregate size limit."
+            )
+        self.bytes_received += size
+
+    def reserve_address_attempt(self) -> float:
+        timeout = self.remaining_timeout()
+        if self.address_attempts >= self.max_address_attempts:
+            raise DownloadLimitError(
+                f"Media download exceeded the {self.max_address_attempts}-address attempt limit."
+            )
+        self.address_attempts += 1
+        return timeout
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """TLS connection whose socket destination is a pre-validated IP address."""
+
+    def __init__(self, host: str, port: int, *, pinned_address: str, timeout: float):
+        self.pinned_address = pinned_address
+        super().__init__(host, port=port, timeout=timeout, context=SSL_CTX)
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self.pinned_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
 def render_html_text(text: str) -> str:
@@ -100,10 +204,23 @@ def reference_summary_data(references: list[dict], *, limit: int = 3) -> dict | 
 
 
 class HtmlReferenceParser(HTMLParser):
-    def __init__(self):
+    def __init__(self, *, max_references: int | None = None):
         super().__init__()
+        self.max_references = (
+            MAX_DOWNLOAD_REFERENCES if max_references is None else max_references
+        )
+        self.reference_count = 0
         self.image_urls: list[str] = []
         self.link_urls: list[str] = []
+
+    def append_reference(self, collection: list[str], url: str) -> None:
+        if self.reference_count >= self.max_references:
+            raise DownloadLimitError(
+                f"Media reference collection exceeded the "
+                f"{self.max_references}-reference limit."
+            )
+        self.reference_count += 1
+        collection.append(unescape(url))
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
         attr_map = {
@@ -113,24 +230,43 @@ class HtmlReferenceParser(HTMLParser):
         }
         tag_name = tag.lower()
         if tag_name == "img" and attr_map.get("src"):
-            self.image_urls.append(unescape(attr_map["src"]))
+            self.append_reference(self.image_urls, attr_map["src"])
         if tag_name == "a" and attr_map.get("href"):
-            self.link_urls.append(unescape(attr_map["href"]))
+            self.append_reference(self.link_urls, attr_map["href"])
 
 
 def normalize_reference_url(url: str) -> str:
     return urllib.parse.urljoin(f"{BASE_URL}/", url)
 
 
-def extract_html_references(raw_html: str) -> tuple[list[str], list[str]]:
-    parser = HtmlReferenceParser()
+def extract_html_references(
+    raw_html: str,
+    *,
+    max_references: int | None = None,
+) -> tuple[list[str], list[str]]:
+    parser = HtmlReferenceParser(max_references=max_references)
     parser.feed(raw_html or "")
     parser.close()
     return parser.image_urls, parser.link_urls
 
 
-def extract_plain_image_urls(text: str) -> list[str]:
-    return IMAGE_URL_PATTERN.findall(text or "")
+def extract_plain_image_urls(
+    text: str,
+    *,
+    max_references: int | None = None,
+) -> list[str]:
+    reference_limit = (
+        MAX_DOWNLOAD_REFERENCES if max_references is None else max_references
+    )
+    urls: list[str] = []
+    for match in IMAGE_URL_PATTERN.finditer(text or ""):
+        if len(urls) >= reference_limit:
+            raise DownloadLimitError(
+                f"Media reference collection exceeded the "
+                f"{reference_limit}-reference limit."
+            )
+        urls.append(match.group(0))
+    return urls
 
 
 def filename_from_url(url: str) -> str:
@@ -178,14 +314,194 @@ def extension_from_headers(headers) -> str:
     return mimetypes.guess_extension(content_type) or ""
 
 
-def unique_download_path(download_dir: str, filename: str) -> str:
+def download_directory_anchor(absolute_dir: str) -> tuple[str, list[str], bool]:
+    """Return the trusted anchor and relative components for an artifact directory."""
+    current_dir = os.path.abspath(os.getcwd())
+    try:
+        inside_current_dir = os.path.commonpath((current_dir, absolute_dir)) == current_dir
+    except ValueError:
+        inside_current_dir = False
+
+    if inside_current_dir:
+        anchor_dir = current_dir
+    else:
+        anchor_dir = os.path.dirname(absolute_dir)
+        while not os.path.exists(anchor_dir):
+            parent_dir = os.path.dirname(anchor_dir)
+            if parent_dir == anchor_dir:
+                break
+            anchor_dir = parent_dir
+    relative_parts = [
+        part
+        for part in os.path.relpath(absolute_dir, anchor_dir).split(os.sep)
+        if part not in ("", ".")
+    ]
+    return anchor_dir, relative_parts, inside_current_dir
+
+
+def validate_existing_download_directory(directory: str) -> str:
+    """Reject an existing directory reached through a symlink or junction."""
+    absolute_dir = os.path.abspath(directory)
+    if (
+        not os.path.isdir(absolute_dir)
+        or os.path.normcase(os.path.realpath(absolute_dir))
+        != os.path.normcase(absolute_dir)
+    ):
+        raise ValueError("Download directory must not contain symlinks or junctions.")
+    return absolute_dir
+
+
+def secure_directory_creation_supported() -> bool:
+    """Return whether directory components can be created and opened by dir-fd."""
+    return (
+        os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+    )
+
+
+def prepare_download_directory(download_dir: str) -> str:
+    """Create a download root and reject paths containing symlinks or junctions."""
+    absolute_dir = os.path.abspath(download_dir)
+    anchor_dir, relative_parts, _inside_current_dir = download_directory_anchor(absolute_dir)
+    anchor_dir = validate_existing_download_directory(anchor_dir)
+
+    if secure_directory_creation_supported():
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            directory_fd = os.open(anchor_dir, flags)
+        except OSError as exc:
+            raise ValueError(
+                "Download directory must not contain symlinks or junctions."
+            ) from exc
+        try:
+            for part in relative_parts:
+                try:
+                    os.mkdir(part, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(part, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise ValueError(
+                        "Download directory must not contain symlinks or junctions."
+                    ) from exc
+                os.close(directory_fd)
+                directory_fd = next_fd
+        finally:
+            os.close(directory_fd)
+        return absolute_dir
+
+    candidate_dir = anchor_dir
+    for part in relative_parts:
+        if part in ("", "."):
+            continue
+        candidate_dir = os.path.join(candidate_dir, part)
+        try:
+            os.mkdir(candidate_dir)
+        except FileExistsError:
+            pass
+        validate_existing_download_directory(candidate_dir)
+    return absolute_dir
+
+
+def open_download_directory(download_dir: str) -> int | None:
+    """Open the artifact directory for race-resistant relative file creation."""
+    if (
+        os.open not in os.supports_dir_fd
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        return None
+    anchor_dir, relative_parts, inside_current_dir = download_directory_anchor(download_dir)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open("." if inside_current_dir else anchor_dir, flags)
+    try:
+        for part in relative_parts:
+            next_fd = os.open(part, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def write_unique_download(
+    download_dir: str,
+    filename: str,
+    payload: bytes,
+    *,
+    budget: DownloadBudget | None = None,
+) -> str:
+    """Create one contained artifact exclusively, without following a final symlink."""
+    if budget is not None:
+        budget.remaining_timeout()
+    safe_dir = prepare_download_directory(download_dir)
+    directory_fd = open_download_directory(safe_dir)
+    if budget is not None:
+        budget.remaining_timeout()
     base, ext = os.path.splitext(filename)
-    candidate = os.path.join(download_dir, filename)
-    counter = 2
-    while os.path.exists(candidate):
-        candidate = os.path.join(download_dir, f"{base}-{counter}{ext}")
-        counter += 1
-    return candidate
+    counter = 1
+    try:
+        while True:
+            candidate_name = filename if counter == 1 else f"{base}-{counter}{ext}"
+            candidate_path = os.path.abspath(os.path.join(safe_dir, candidate_name))
+            try:
+                if os.path.commonpath((safe_dir, candidate_path)) != safe_dir:
+                    raise ValueError("Download filename escapes the artifact directory.")
+            except ValueError as exc:
+                raise ValueError("Download filename escapes the artifact directory.") from exc
+
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                if directory_fd is None:
+                    if os.path.normcase(os.path.realpath(safe_dir)) != os.path.normcase(safe_dir):
+                        raise ValueError("Download directory changed before artifact creation.")
+                    file_fd = os.open(candidate_path, flags, 0o600)
+                else:
+                    file_fd = os.open(candidate_name, flags, 0o600, dir_fd=directory_fd)
+            except FileExistsError:
+                counter += 1
+                continue
+
+            try:
+                with os.fdopen(file_fd, "wb") as handle:
+                    for offset in range(0, len(payload), DOWNLOAD_READ_CHUNK_BYTES):
+                        if budget is not None:
+                            budget.remaining_timeout()
+                        handle.write(payload[offset:offset + DOWNLOAD_READ_CHUNK_BYTES])
+                    if budget is not None:
+                        budget.remaining_timeout()
+            except Exception:
+                try:
+                    if directory_fd is not None and os.unlink in os.supports_dir_fd:
+                        os.unlink(candidate_name, dir_fd=directory_fd)
+                    else:
+                        os.unlink(candidate_path)
+                except OSError:
+                    pass
+                raise
+            return candidate_path
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def fully_unquote_url_segment(segment: str) -> str:
+    """Decode nested percent escapes so path traversal cannot hide behind re-encoding."""
+    decoded = segment
+    for _ in range(len(segment) + 1):
+        next_value = urllib.parse.unquote(decoded)
+        if next_value == decoded:
+            return decoded
+        decoded = next_value
+    return decoded
 
 
 def is_trusted_azure_devops_url(url: str, org_name: str | None = None) -> bool:
@@ -210,15 +526,291 @@ def is_trusted_azure_devops_url(url: str, org_name: str | None = None) -> bool:
     hostname = (parsed.hostname or "").casefold()
     org = configured_org.casefold()
     if hostname == "dev.azure.com":
-        path_segments = parsed.path.split("/")
-        if len(path_segments) < 2:
+        raw_segments = parsed.path.split("/")[1:]
+        if not raw_segments:
             return False
-        return urllib.parse.unquote(path_segments[1]).casefold() == org
+        decoded_segments = [fully_unquote_url_segment(segment) for segment in raw_segments]
+        if any(
+            segment in (".", "..") or "/" in segment or "\\" in segment
+            for segment in decoded_segments
+        ):
+            return False
+        return decoded_segments[0].casefold() == org
 
     return hostname == f"{configured_org}.visualstudio.com".casefold()
 
 
-def read_bounded_download(response, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
+def validate_public_hostname(
+    hostname: str,
+    port: int,
+    *,
+    resolver=None,
+    budget: DownloadBudget | None = None,
+) -> tuple[str, ...]:
+    """Reject hostnames unless every resolved address is globally routable."""
+    hostname_resolver = socket.getaddrinfo if resolver is None else resolver
+    try:
+        if budget is None:
+            addresses = hostname_resolver(hostname, port, type=socket.SOCK_STREAM)
+        else:
+            resolver_result: queue.Queue = queue.Queue(maxsize=1)
+
+            def resolve() -> None:
+                try:
+                    resolver_result.put((True, hostname_resolver(
+                        hostname,
+                        port,
+                        type=socket.SOCK_STREAM,
+                    )))
+                except Exception as exc:
+                    resolver_result.put((False, exc))
+
+            threading.Thread(target=resolve, daemon=True).start()
+            try:
+                succeeded, result = resolver_result.get(timeout=budget.remaining_timeout())
+            except queue.Empty as exc:
+                raise DownloadLimitError(
+                    "Media download exceeded the total wall-clock time limit during DNS resolution."
+                ) from exc
+            budget.remaining_timeout()
+            if not succeeded:
+                raise result
+            addresses = result
+    except OSError as exc:
+        raise ValueError(f"Could not resolve media hostname {hostname!r}.") from exc
+    if not addresses:
+        raise ValueError(f"Media hostname {hostname!r} did not resolve to an address.")
+
+    public_addresses: list[str] = []
+    address_limit = (
+        MAX_VALIDATED_ADDRESS_ATTEMPTS
+        if budget is None
+        else budget.max_address_attempts
+    )
+    for address_index, address_info in enumerate(addresses):
+        if budget is not None and address_index % 16 == 0:
+            budget.remaining_timeout()
+        try:
+            address_text = address_info[4][0].split("%", 1)[0]
+            address = ipaddress.ip_address(address_text)
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ValueError(f"Media hostname {hostname!r} resolved to an invalid address.") from exc
+        if (
+            not address.is_global
+            or address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise ValueError(
+                f"Media hostname {hostname!r} resolved to non-public address {address_text!r}."
+            )
+        if address_text not in public_addresses and len(public_addresses) < address_limit:
+            public_addresses.append(address_text)
+    if budget is not None:
+        budget.remaining_timeout()
+    return tuple(public_addresses)
+
+
+def validate_media_download_url(
+    url: str,
+    *,
+    allowed_origins: tuple[str, ...] | None = None,
+    org_name: str | None = None,
+    resolver=None,
+    budget: DownloadBudget | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Validate one media URL hop and return its origin and pinned public addresses."""
+    if not url or "\\" in url or any(ord(character) < 32 or ord(character) == 127 for character in url):
+        raise ValueError(f"Invalid media download URL: {url!r}")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid media download URL: {url!r}") from exc
+
+    if parsed.scheme.casefold() != "https":
+        raise ValueError(f"Media download URL must use HTTPS: {url}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"Media download URL must not include userinfo: {url}")
+
+    raw_origin = f"https://{parsed.netloc}"
+    origin = normalize_https_origin(raw_origin)
+    hostname = urllib.parse.urlsplit(origin).hostname or ""
+    configured_origins = (
+        AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS if allowed_origins is None else allowed_origins
+    )
+    if not is_trusted_azure_devops_url(url, org_name) and origin not in configured_origins:
+        raise ValueError(
+            f"External media origin {origin!r} is not allowed. "
+            "Configure AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS to allow it explicitly."
+        )
+
+    public_addresses = validate_public_hostname(
+        hostname,
+        port or 443,
+        resolver=resolver,
+        budget=budget,
+    )
+    return origin, public_addresses
+
+
+def response_status(response) -> int | None:
+    status = getattr(response, "status", None)
+    if status is not None:
+        return status
+    getcode = getattr(response, "getcode", None)
+    return getcode() if getcode else None
+
+
+def close_download_response(response) -> None:
+    close = getattr(response, "close", None)
+    if close:
+        close()
+
+
+def open_pinned_https_request(
+    request,
+    public_addresses: tuple[str, ...],
+    *,
+    budget: DownloadBudget | None = None,
+):
+    """Open an HTTPS request without performing a second, attacker-controlled DNS lookup."""
+    download_budget = DownloadBudget() if budget is None else budget
+    parsed = urllib.parse.urlsplit(request.full_url)
+    hostname = parsed.hostname or ""
+    port = parsed.port or 443
+    request_path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    headers = dict(request.header_items())
+    last_error: Exception | None = None
+    for address in public_addresses:
+        timeout = download_budget.reserve_address_attempt()
+        connection = PinnedHTTPSConnection(
+            hostname,
+            port,
+            pinned_address=address,
+            timeout=timeout,
+        )
+        try:
+            connection.request(request.get_method(), request_path, headers=headers)
+            response = connection.getresponse()
+            try:
+                download_budget.remaining_timeout()
+            except DownloadLimitError:
+                response.close()
+                connection.close()
+                raise
+            return response
+        except (OSError, http.client.HTTPException) as exc:
+            last_error = exc
+            connection.close()
+    if last_error is not None:
+        raise last_error
+    raise ValueError(f"Media hostname {hostname!r} had no validated public addresses.")
+
+
+def open_validated_download(
+    token: str,
+    url: str,
+    *,
+    opener=None,
+    allowed_origins: tuple[str, ...] | None = None,
+    org_name: str | None = None,
+    resolver=None,
+    max_redirects: int = MAX_DOWNLOAD_REDIRECTS,
+    budget: DownloadBudget | None = None,
+):
+    """Open a media URL after validating the initial request and each redirect."""
+    download_budget = DownloadBudget() if budget is None else budget
+    download_opener = DOWNLOAD_OPENER if opener is None else opener
+    current_url = urllib.parse.urldefrag(url)[0]
+    visited_urls: set[str] = set()
+
+    for redirect_count in range(max_redirects + 1):
+        download_budget.remaining_timeout()
+        if current_url in visited_urls:
+            raise ValueError(f"Media download redirect loop detected at {current_url}")
+        visited_urls.add(current_url)
+        _origin, public_addresses = validate_media_download_url(
+            current_url,
+            allowed_origins=allowed_origins,
+            org_name=org_name,
+            resolver=resolver,
+            budget=download_budget,
+        )
+        download_budget.remaining_timeout()
+
+        request = urllib.request.Request(current_url, headers={"Accept": "*/*"})
+        if is_trusted_azure_devops_url(current_url, org_name):
+            request.add_unredirected_header("Authorization", f"Bearer {token}")
+
+        if opener is None and download_opener is DEFAULT_DOWNLOAD_OPENER:
+            response = open_pinned_https_request(
+                request,
+                public_addresses,
+                budget=download_budget,
+            )
+        else:
+            try:
+                response = download_opener.open(
+                    request,
+                    timeout=download_budget.remaining_timeout(),
+                )
+            except urllib.error.HTTPError as exc:
+                if exc.code not in DOWNLOAD_REDIRECT_STATUS_CODES:
+                    raise
+                response = exc
+
+        try:
+            download_budget.remaining_timeout()
+        except DownloadLimitError:
+            close_download_response(response)
+            raise
+        status = response_status(response)
+        if status is not None and status >= 400:
+            reason = getattr(response, "reason", "HTTP error")
+            headers = response.headers
+            close_download_response(response)
+            raise urllib.error.HTTPError(
+                current_url,
+                status,
+                reason,
+                headers,
+                None,
+            )
+        if status not in DOWNLOAD_REDIRECT_STATUS_CODES:
+            return response, current_url
+
+        location = response.headers.get("Location", "")
+        close_download_response(response)
+        if not location:
+            raise ValueError(f"Media download redirect from {current_url} has no Location header.")
+        if redirect_count >= max_redirects:
+            raise ValueError(f"Media download exceeded the {max_redirects}-redirect limit.")
+        current_url = urllib.parse.urldefrag(urllib.parse.urljoin(current_url, location))[0]
+
+    raise ValueError(f"Media download exceeded the {max_redirects}-redirect limit.")
+
+
+def set_download_response_timeout(response, timeout: float) -> None:
+    """Tighten the active response socket timeout to the shared deadline."""
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    response_socket = getattr(raw, "_sock", None)
+    if response_socket is not None:
+        response_socket.settimeout(timeout)
+
+
+def read_bounded_download(
+    response,
+    *,
+    max_bytes: int = MAX_DOWNLOAD_BYTES,
+    budget: DownloadBudget | None = None,
+) -> bytes:
+    download_budget = DownloadBudget() if budget is None else budget
+    download_budget.remaining_timeout()
     content_length = response.headers.get("Content-Length")
     if content_length:
         try:
@@ -227,11 +819,34 @@ def read_bounded_download(response, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> b
             declared_size = None
         if declared_size is not None and declared_size > max_bytes:
             raise ValueError(f"Download exceeds the {max_bytes}-byte size limit.")
+        if declared_size is not None and declared_size > download_budget.remaining_bytes:
+            raise DownloadLimitError(
+                f"Media downloads exceed the {download_budget.max_total_bytes}-byte aggregate size limit."
+            )
 
-    payload = response.read(max_bytes + 1)
-    if len(payload) > max_bytes:
-        raise ValueError(f"Download exceeds the {max_bytes}-byte size limit.")
-    return payload
+    chunks: list[bytes] = []
+    file_bytes = 0
+    read_func = getattr(response, "read1", None) or response.read
+    while True:
+        timeout = download_budget.remaining_timeout()
+        set_download_response_timeout(response, timeout)
+        remaining_file = max(0, max_bytes - file_bytes)
+        remaining_aggregate = download_budget.remaining_bytes
+        read_size = min(
+            DOWNLOAD_READ_CHUNK_BYTES,
+            remaining_file + 1,
+            remaining_aggregate + 1,
+        )
+        chunk = read_func(read_size)
+        download_budget.remaining_timeout()
+        if not chunk:
+            break
+        download_budget.record_bytes(len(chunk))
+        file_bytes += len(chunk)
+        if file_bytes > max_bytes:
+            raise ValueError(f"Download exceeds the {max_bytes}-byte size limit.")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def build_reference(source: str, label: str, url: str, *, name: str = "", is_image: bool) -> dict:
@@ -262,8 +877,36 @@ def dedupe_references(references: list[dict]) -> list[dict]:
     return unique
 
 
-def collect_attachment_references(item: dict, comments: list[dict]) -> list[dict]:
+def collect_attachment_references(
+    item: dict,
+    comments: list[dict],
+    *,
+    max_references: int | None = None,
+) -> list[dict]:
+    reference_limit = (
+        MAX_DOWNLOAD_REFERENCES if max_references is None else max_references
+    )
     references: list[dict] = []
+    seen: set[tuple[str, str, str, str, bool]] = set()
+
+    def add_reference(reference: dict) -> None:
+        key = (
+            reference["source"],
+            reference["label"],
+            reference["url"],
+            reference.get("name", ""),
+            reference["is_image"],
+        )
+        if key in seen:
+            return
+        if len(references) >= reference_limit:
+            raise DownloadLimitError(
+                f"Media reference collection exceeded the "
+                f"{reference_limit}-reference limit."
+            )
+        seen.add(key)
+        references.append(reference)
+
     for relation in item.get("relations", []):
         rel_type = relation.get("rel", "")
         url = relation.get("url", "")
@@ -272,7 +915,7 @@ def collect_attachment_references(item: dict, comments: list[dict]) -> list[dict
         name = relation.get("attributes", {}).get("name", "")
         image_relation = is_image_name(name) or is_image_url(url)
         if rel_type == "AttachedFile" or image_relation:
-            references.append(
+            add_reference(
                 build_reference(
                     "relation",
                     rel_type or "Relation",
@@ -284,28 +927,34 @@ def collect_attachment_references(item: dict, comments: list[dict]) -> list[dict
 
     for field_name, label in WORK_ITEM_TEXT_FIELDS:
         raw_html = item.get("fields", {}).get(field_name, "")
-        image_urls, link_urls = extract_html_references(raw_html)
+        image_urls, link_urls = extract_html_references(
+            raw_html,
+            max_references=reference_limit,
+        )
         for url in image_urls:
-            references.append(build_reference("field", label, url, name=filename_from_url(url), is_image=True))
+            add_reference(build_reference("field", label, url, name=filename_from_url(url), is_image=True))
         for url in link_urls:
             if is_image_url(url):
-                references.append(build_reference("field", label, url, name=filename_from_url(url), is_image=True))
-        for url in extract_plain_image_urls(raw_html):
-            references.append(build_reference("field", label, url, name=filename_from_url(url), is_image=True))
+                add_reference(build_reference("field", label, url, name=filename_from_url(url), is_image=True))
+        for url in extract_plain_image_urls(raw_html, max_references=reference_limit):
+            add_reference(build_reference("field", label, url, name=filename_from_url(url), is_image=True))
 
     for comment in comments:
         label = f"Comment {comment.get('id', '?')}"
         raw_html = comment.get("text", "") or ""
-        image_urls, link_urls = extract_html_references(raw_html)
+        image_urls, link_urls = extract_html_references(
+            raw_html,
+            max_references=reference_limit,
+        )
         for url in image_urls:
-            references.append(build_reference("comment", label, url, name=filename_from_url(url), is_image=True))
+            add_reference(build_reference("comment", label, url, name=filename_from_url(url), is_image=True))
         for url in link_urls:
             if is_image_url(url):
-                references.append(build_reference("comment", label, url, name=filename_from_url(url), is_image=True))
-        for url in extract_plain_image_urls(raw_html):
-            references.append(build_reference("comment", label, url, name=filename_from_url(url), is_image=True))
+                add_reference(build_reference("comment", label, url, name=filename_from_url(url), is_image=True))
+        for url in extract_plain_image_urls(raw_html, max_references=reference_limit):
+            add_reference(build_reference("comment", label, url, name=filename_from_url(url), is_image=True))
 
-    return dedupe_references(references)
+    return references
 
 
 def serialize_reference(reference: dict) -> dict:
@@ -646,28 +1295,28 @@ def download_reference(
     download_dir: str,
     sequence: int,
     downloaded_urls: dict[str, str],
+    *,
+    budget: DownloadBudget | None = None,
 ) -> tuple[str, bool]:
     url = reference["url"]
     if url in downloaded_urls:
         return downloaded_urls[url], True
 
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"Unsupported download URL: {url}")
-
-    req = urllib.request.Request(url, headers={"Accept": "*/*"})
-    if is_trusted_azure_devops_url(url):
-        # Keep credentials on the initial request only. urllib's redirect handler
-        # copies regular headers, but intentionally omits unredirected headers.
-        req.add_unredirected_header("Authorization", f"Bearer {token}")
-    with OPENER.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
-        payload = read_bounded_download(resp)
+    download_budget = DownloadBudget() if budget is None else budget
+    download_budget.remaining_timeout()
+    response, final_url = open_validated_download(
+        token,
+        url,
+        budget=download_budget,
+    )
+    with response as resp:
+        payload = read_bounded_download(resp, budget=download_budget)
         headers = resp.headers
 
     filename_candidates = [
         reference.get("name", ""),
         filename_from_headers(headers),
-        filename_from_url(url),
+        filename_from_url(final_url),
     ]
     filename = ""
     for candidate in filename_candidates:
@@ -685,10 +1334,13 @@ def download_reference(
             extension = ".bin"
         filename = f"{filename}{extension}"
 
-    os.makedirs(download_dir, exist_ok=True)
-    target_path = unique_download_path(download_dir, filename)
-    with open(target_path, "wb") as handle:
-        handle.write(payload)
+    download_budget.remaining_timeout()
+    target_path = write_unique_download(
+        download_dir,
+        filename,
+        payload,
+        budget=download_budget,
+    )
 
     downloaded_urls[url] = target_path
     return target_path, False

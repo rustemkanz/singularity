@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -147,6 +148,13 @@ class ReviewProvider(Protocol):
     ) -> ChangeRequest:
         ...
 
+    def create_prepared_change_request(
+        self,
+        repository: RepositoryRef,
+        payload: dict,
+    ) -> ChangeRequest:
+        ...
+
     def prepare_review_comment(
         self,
         context: ReviewContext,
@@ -160,6 +168,13 @@ class ReviewProvider(Protocol):
         context: ReviewContext,
         *,
         text: str,
+    ) -> ReviewMutationResult:
+        ...
+
+    def create_prepared_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
     ) -> ReviewMutationResult:
         ...
 
@@ -189,6 +204,13 @@ class ReviewProvider(Protocol):
     ) -> ReviewMutationResult:
         ...
 
+    def create_prepared_inline_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
+        ...
+
     def prepare_review_reply(
         self,
         context: ReviewContext,
@@ -206,6 +228,13 @@ class ReviewProvider(Protocol):
         thread_id: int | str,
         text: str,
         parent_comment_id: int | None,
+    ) -> ReviewMutationResult:
+        ...
+
+    def create_prepared_review_reply(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
     ) -> ReviewMutationResult:
         ...
 
@@ -229,6 +258,13 @@ class ReviewProvider(Protocol):
     ) -> ReviewMutationResult:
         ...
 
+    def edit_prepared_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
+        ...
+
     def prepare_review_thread_resolution(
         self,
         context: ReviewContext,
@@ -244,6 +280,13 @@ class ReviewProvider(Protocol):
         *,
         thread_id: int | str,
         status: str,
+    ) -> ReviewMutationResult:
+        ...
+
+    def resolve_prepared_review_thread(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
     ) -> ReviewMutationResult:
         ...
 
@@ -290,6 +333,7 @@ class BuildProvider(Protocol):
         definition: int,
         project: str,
         source_branch: str,
+        source_version: str,
         parameters: dict | None,
     ) -> QueuedBuild:
         ...
@@ -348,6 +392,26 @@ class WorkItemCommentsSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class WorkItemTransitionPreview:
+    provider: str
+    item_id: int
+    requested_state: str
+    concrete_state: str
+    current_snapshot: dict
+    request: dict
+
+    def to_plan_payload(self) -> dict:
+        return {
+            "provider": self.provider,
+            "workItemId": self.item_id,
+            "requestedState": self.requested_state,
+            "concreteState": self.concrete_state,
+            "currentSnapshot": copy.deepcopy(self.current_snapshot),
+            "request": copy.deepcopy(self.request),
+        }
+
+
 class WorkTrackingProvider(Protocol):
     def list_teams(self) -> list[TeamRef]:
         ...
@@ -367,7 +431,19 @@ class WorkTrackingProvider(Protocol):
     def get_start_work_plan(self, *, item_id: int) -> StartWorkPlan:
         ...
 
-    def transition_work_item(self, *, item_id: int, state: str, assignee: str | None = None) -> None:
+    def prepare_work_item_transition(
+        self,
+        *,
+        item_id: int,
+        state: str,
+        assignee: str | None = None,
+    ) -> WorkItemTransitionPreview:
+        ...
+
+    def apply_prepared_work_item_transition(self, preview: WorkItemTransitionPreview) -> str:
+        ...
+
+    def transition_work_item(self, *, item_id: int, state: str, assignee: str | None = None) -> str:
         ...
 
     def get_triage_report(self, *, item_ids: list[int]) -> TriageReport:

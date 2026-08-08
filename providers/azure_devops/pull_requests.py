@@ -275,6 +275,7 @@ def build_change_request(
             project_name=project_name,
             org_name=org_name,
         ) if pr.get("pullRequestId") is not None else "",
+        provider="azure-devops",
     )
 
 

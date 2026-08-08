@@ -54,7 +54,8 @@ Every live smoke run should capture the resulting disposable artifact ids so the
 - Keep the changed file small and obviously synthetic.
 - Verify the target checkout with `git rev-parse --show-toplevel`, `git remote -v`, and `git branch --show-current`, then run an installed `sg` from that checkout.
 - Pass explicit `--repo` and `--source` values for change-request operations.
-- Run every plan-first mutation without `--apply`, review the output, and obtain explicit approval before repeating it with `--apply`.
+- Run every mutation without `--apply`, review its complete output and `sha256:` Plan ID, and obtain explicit approval before repeating the otherwise unchanged command with `--apply <PLAN_ID>`.
+- If an applied mutation times out or returns an ambiguous error, inspect provider state before previewing a retry; the original request may already have succeeded.
 - Prefer projects or repos where comments, branches, PRs, and workflow transitions are safe to exercise.
 - Clean up the PR or merge request, branch, and work item after validation unless the reviewer explicitly wants them left in place.
 - Record provider-specific workflow state names instead of assuming literals such as `In Progress` or `Done`.
@@ -100,15 +101,14 @@ The current implementation supports this scenario most fully in Azure DevOps.
 
 ```bash
 sg comment <item-id> "Singularity smoke test comment. No product work requested. AI-assisted via Copilot."
-sg comment <item-id> "Singularity smoke test comment. No product work requested. AI-assisted via Copilot." --apply
+sg comment <item-id> "Singularity smoke test comment. No product work requested. AI-assisted via Copilot." --apply <PLAN_ID>
 ```
 
 4. Prepare work metadata and start work.
 
 ```bash
-sg start-work <item-id>
 sg start <item-id> --branch test/<item-id>-singularity-smoke
-sg start <item-id> --branch test/<item-id>-singularity-smoke --apply
+sg start <item-id> --branch test/<item-id>-singularity-smoke --apply <PLAN_ID>
 ```
 
 5. Create the disposable branch in the real work repo and add one synthetic file.
@@ -125,7 +125,7 @@ git push -u origin test/<item-id>-singularity-smoke
 
 ```bash
 sg create-pr <item-id> --repo <repo> --source test/<item-id>-singularity-smoke
-sg create-pr <item-id> --repo <repo> --source test/<item-id>-singularity-smoke --apply
+sg create-pr <item-id> --repo <repo> --source test/<item-id>-singularity-smoke --apply <PLAN_ID>
 ```
 
 7. Read the PR back through the helper.
@@ -142,16 +142,20 @@ sg create-pr <item-id> --repo <repo> --source test/<item-id>-singularity-smoke -
 
 ```bash
 ./sg pr-comment --url <ado-pr-url> "Top-level smoke test thread. AI-assisted via Copilot."
+./sg pr-comment --url <ado-pr-url> "Top-level smoke test thread. AI-assisted via Copilot." --apply <PLAN_ID>
 ./sg pr-reply --url <ado-pr-url> --thread <thread-id> "Reply smoke test. AI-assisted via Copilot."
+./sg pr-reply --url <ado-pr-url> --thread <thread-id> "Reply smoke test. AI-assisted via Copilot." --apply <PLAN_ID>
 ./sg pr-edit-comment --url <ado-pr-url> --thread <thread-id> --comment <comment-id> "Edited smoke test reply. AI-assisted via Copilot."
+./sg pr-edit-comment --url <ado-pr-url> --thread <thread-id> --comment <comment-id> "Edited smoke test reply. AI-assisted via Copilot." --apply <PLAN_ID>
 ./sg pr-resolve --url <ado-pr-url> --thread <thread-id>
+./sg pr-resolve --url <ado-pr-url> --thread <thread-id> --apply <PLAN_ID>
 ```
 
 9. Move the work item into review.
 
 ```bash
 sg review <item-id>
-sg review <item-id> --apply
+sg review <item-id> --apply <PLAN_ID>
 ```
 
 10. Clean up the disposable artifacts.
@@ -196,23 +200,29 @@ The current GitLab slice is merge-request-centered, with a public read path and 
 ./sg show <issue-id> --provider gitlab --repo <group/project>
 ./sg comments <issue-id> --provider gitlab --repo <group/project>
 sg comment <issue-id> --provider gitlab --repo <group/project> "GitLab issue smoke comment. AI-assisted via Copilot."
-sg comment <issue-id> --provider gitlab --repo <group/project> "GitLab issue smoke comment. AI-assisted via Copilot." --apply
-sg start-work <issue-id> --provider gitlab --repo <group/project>
+sg comment <issue-id> --provider gitlab --repo <group/project> "GitLab issue smoke comment. AI-assisted via Copilot." --apply <PLAN_ID>
 sg start <issue-id> --provider gitlab --repo <group/project> --branch issue/<issue-id>-smoke
-sg start <issue-id> --provider gitlab --repo <group/project> --branch issue/<issue-id>-smoke --apply
+sg start <issue-id> --provider gitlab --repo <group/project> --branch issue/<issue-id>-smoke --apply <PLAN_ID>
 sg create-pr <issue-id> --provider gitlab --repo <group/project> --source <disposable-branch> --work-item-title "Disposable smoke issue"
-sg create-pr <issue-id> --provider gitlab --repo <group/project> --source <disposable-branch> --work-item-title "Disposable smoke issue" --apply
+sg create-pr <issue-id> --provider gitlab --repo <group/project> --source <disposable-branch> --work-item-title "Disposable smoke issue" --apply <PLAN_ID>
 ./sg pr-comments --url <gitlab-mr-url>
 ./sg pr-statuses --url <gitlab-mr-url>
 ./sg pr-comment --url <gitlab-mr-url> "Top-level GitLab smoke thread. AI-assisted via Copilot."
+./sg pr-comment --url <gitlab-mr-url> "Top-level GitLab smoke thread. AI-assisted via Copilot." --apply <PLAN_ID>
 ./sg pr-inline-comment --url <gitlab-mr-url> --path /smoke-test-<issue-id>.txt --line 1 "Inline GitLab smoke thread. AI-assisted via Copilot."
+./sg pr-inline-comment --url <gitlab-mr-url> --path /smoke-test-<issue-id>.txt --line 1 "Inline GitLab smoke thread. AI-assisted via Copilot." --apply <PLAN_ID>
 ./sg pr-reply --url <gitlab-mr-url> --thread <thread-id> "Reply smoke test. AI-assisted via Copilot."
+./sg pr-reply --url <gitlab-mr-url> --thread <thread-id> "Reply smoke test. AI-assisted via Copilot." --apply <PLAN_ID>
 ./sg pr-edit-comment --url <gitlab-mr-url> --thread <thread-id> --comment <comment-id> "Edited smoke test reply. AI-assisted via Copilot."
+./sg pr-edit-comment --url <gitlab-mr-url> --thread <thread-id> --comment <comment-id> "Edited smoke test reply. AI-assisted via Copilot." --apply <PLAN_ID>
 ./sg pr-resolve --url <gitlab-mr-url> --thread <thread-id>
+./sg pr-resolve --url <gitlab-mr-url> --thread <thread-id> --apply <PLAN_ID>
 sg review <issue-id> --provider gitlab --repo <group/project>
-sg review <issue-id> --provider gitlab --repo <group/project> --apply
+sg review <issue-id> --provider gitlab --repo <group/project> --apply <PLAN_ID>
 ./sg testing <issue-id> --provider gitlab --repo <group/project> --qa <gitlab-username>
+./sg testing <issue-id> --provider gitlab --repo <group/project> --qa <gitlab-username> --apply <PLAN_ID>
 ./sg cleanup-artifacts --provider gitlab --repo <group/project> --issue <issue-id> --mr <mr-id> --branch <disposable-branch>
+./sg cleanup-artifacts --provider gitlab --repo <group/project> --issue <issue-id> --mr <mr-id> --branch <disposable-branch> --apply <PLAN_ID>
 ```
 
 ### GitLab-Specific Lessons Already Confirmed
@@ -220,7 +230,7 @@ sg review <issue-id> --provider gitlab --repo <group/project> --apply
 - GitLab-specific runs do not use the `AZURE_DEVOPS_*` configuration used by the ADO reference run.
 - Public merge requests can now be inspected live without `GITLAB_TOKEN` for `pr-analyze`, `pr-files`, `pr-file`, and `pr-diff`.
 - GitLab can still return `401 Unauthorized` for discussion-thread and commit-status APIs on otherwise public merge requests, so `pr-comments` and `pr-statuses` may still need `GITLAB_TOKEN`.
-- With access to the project, `show`, `comments`, and `start-work` are read-only; `start-work` prints the canonical issue branch/PR plan. `comment` previews by default and posts only with `--apply` when you pass `--provider gitlab --repo <group/project>`.
+- With access to the project, `show` and `comments` are read-only; `start` prints the canonical issue branch/PR/state plan and mutates only with an exact approved Plan ID. `comment` follows the same preview/apply contract when you pass `--provider gitlab --repo <group/project>`.
 - With authenticated access to a writable project, `start`, `review`, and `testing` can now move GitLab issues through helper-owned workflow labels, and `testing` can also assign a GitLab username.
 - With authenticated access to a writable project and source branch, `create-pr --provider gitlab --repo <group/project>` can now open a merge request.
 - With authenticated access to a writable merge request, top-level discussion creation, inline diff comments, reply, note edit, and thread resolution are now viable.

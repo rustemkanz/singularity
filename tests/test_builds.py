@@ -2,16 +2,93 @@ import argparse
 import contextlib
 import io
 import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 from cli_commands import builds as build_commands
 from errors import CliError
+from mutation_plans import (
+    MutationPlan,
+    PLAN_STORE_ENVIRONMENT_VARIABLE,
+    register_plan_preview,
+)
 from providers.azure_devops.build_provider import AzureDevOpsBuildProvider
 import workflow_models
 
 
+SOURCE_VERSION = "a" * 40
+UPDATED_SOURCE_VERSION = "b" * 40
+
+
 class BuildCommandTests(unittest.TestCase):
+    def setUp(self):
+        self._plan_store = tempfile.TemporaryDirectory()
+        self.addCleanup(self._plan_store.cleanup)
+        self._plan_store_environment = mock.patch.dict(
+            os.environ,
+            {PLAN_STORE_ENVIRONMENT_VARIABLE: self._plan_store.name},
+        )
+        self._plan_store_environment.start()
+        self.addCleanup(self._plan_store_environment.stop)
+
+    @staticmethod
+    def _queue_build_plan(
+        *,
+        definition: int = 123,
+        project: str = "Example Project",
+        source_branch: str = "refs/heads/main",
+        source_version: str = SOURCE_VERSION,
+        parameters: dict | None = None,
+        allow_duplicate: bool = False,
+        recent_duplicates: list[dict] | None = None,
+    ) -> MutationPlan:
+        plan = MutationPlan(
+            action="build.queue",
+            target={
+                "provider": "azure-devops",
+                "organization": build_commands.ORG,
+                "project": project,
+                "definitionId": definition,
+            },
+            payload={
+                "sourceBranch": source_branch,
+                "sourceVersion": source_version,
+                "parameters": parameters,
+                "allowDuplicate": allow_duplicate,
+                "recentDuplicates": recent_duplicates or [],
+            },
+        )
+        register_plan_preview(plan)
+        return plan
+
+    @staticmethod
+    def _approve_gate_plan(
+        approval: workflow_models.PendingBuildApproval,
+        *,
+        build_id: int = 99,
+        project: str = "Example Project",
+        comment: str = "Approved via CLI",
+    ) -> MutationPlan:
+        plan = MutationPlan(
+            action="build.gate.approve",
+            target={
+                "provider": "azure-devops",
+                "organization": build_commands.ORG,
+                "project": project,
+                "buildId": build_id,
+                "approvalId": approval.id,
+            },
+            payload={
+                "status": "approved",
+                "comment": comment,
+                "pendingApproval": approval.to_legacy_dict(),
+            },
+        )
+        register_plan_preview(plan)
+        return plan
+
     def test_cmd_build_logs_json_uses_build_provider(self):
         args = argparse.Namespace(
             build_id=99,
@@ -167,7 +244,7 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn("Use either --branch or --latest-for-branch", str(exc.exception))
 
     def test_cmd_build_status_json_uses_build_provider(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=True, watch=False, approve=False, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=60)
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=True, watch=False, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=60)
         snapshot = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -222,7 +299,7 @@ class BuildCommandTests(unittest.TestCase):
         )
 
     def test_cmd_build_status_json_can_show_log_ids(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=True, watch=False, approve=False, verbose=False, show_log_ids=True, stage=None, only_failed=False, only_active=False, interval=60)
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=True, watch=False, verbose=False, show_log_ids=True, stage=None, only_failed=False, only_active=False, interval=60)
         snapshot = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -267,7 +344,7 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn("log=44", rendered["timeline"][1])
 
     def test_cmd_build_status_renders_failure_tail_summary(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=False, approve=False, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=60)
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=False, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=60)
         snapshot = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -319,20 +396,8 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn("failure: Traceback (most recent call last):", rendered)
         self.assertIn("failure: ValueError: bad asset name", rendered)
 
-    def test_cmd_build_status_rejects_approve_without_watch(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=False, approve=True, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=60)
-
-        with self.assertRaises(CliError) as exc:
-            build_commands.cmd_build_status(
-                args,
-                token="token",
-                build_build_provider_func=lambda _token: mock.Mock(),
-            )
-
-        self.assertIn("--approve requires --watch", str(exc.exception))
-
-    def test_cmd_build_status_watch_can_approve_pending_gates(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=True, approve=True, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=5)
+    def test_cmd_build_status_watch_is_read_only(self):
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=True, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=5)
         snapshot_waiting = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -375,16 +440,9 @@ class BuildCommandTests(unittest.TestCase):
             ],
             orphan_tasks=[],
         )
-        approval = workflow_models.PendingBuildApproval(
-            id="42",
-            pipeline_id="99",
-            status="pending",
-        )
 
         provider = mock.Mock()
         provider.get_build_status_snapshot.side_effect = [snapshot_waiting, snapshot_completed]
-        provider.list_pending_approvals.side_effect = [[approval], []]
-        provider.approve_pending_approval.return_value = True
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             build_commands.cmd_build_status(
@@ -392,23 +450,154 @@ class BuildCommandTests(unittest.TestCase):
                 token="token",
                 build_build_provider_func=lambda _token: provider,
                 get_token_func=lambda: "token",
-                input_func=lambda _prompt: "y",
                 sleep_func=lambda _seconds: None,
             )
 
-        provider.list_pending_approvals.assert_any_call(project="Example Project", build_id=99)
+        self.assertEqual(provider.get_build_status_snapshot.call_count, 2)
+        provider.list_pending_approvals.assert_not_called()
+        provider.approve_pending_approval.assert_not_called()
+        rendered = stdout.getvalue()
+        self.assertIn("reason: waiting for approval: ManualValidation", rendered)
+
+    def test_cmd_build_approvals_json_is_read_only(self):
+        args = argparse.Namespace(build_id=99, project="Example Project", json=True)
+        approval = workflow_models.PendingBuildApproval(
+            id="42",
+            pipeline_id="99",
+            status="pending",
+        )
+        provider = mock.Mock()
+        provider.list_pending_approvals.return_value = [approval]
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            build_commands.cmd_build_approvals(
+                args,
+                token="token",
+                build_build_provider_func=lambda _token: provider,
+            )
+
+        rendered = json.loads(stdout.getvalue())
+        self.assertEqual(rendered["buildId"], 99)
+        self.assertEqual(rendered["approvals"], [approval.to_legacy_dict()])
+        provider.list_pending_approvals.assert_called_once_with(
+            project="Example Project",
+            build_id=99,
+        )
+        provider.approve_pending_approval.assert_not_called()
+
+    def test_cmd_build_approvals_text_reports_no_pending_approvals(self):
+        args = argparse.Namespace(build_id=99, project="Example Project", json=False)
+        provider = mock.Mock()
+        provider.list_pending_approvals.return_value = []
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            build_commands.cmd_build_approvals(
+                args,
+                token="token",
+                build_build_provider_func=lambda _token: provider,
+            )
+
+        self.assertIn("No pending approvals for build 99", stdout.getvalue())
+        provider.approve_pending_approval.assert_not_called()
+
+    def test_cmd_approve_gate_previews_exact_pending_approval(self):
+        args = argparse.Namespace(
+            build_id=99,
+            project="Example Project",
+            approval="42",
+            comment="Ship it",
+            json=True,
+            apply=None,
+        )
+        approval = workflow_models.PendingBuildApproval(
+            id="42",
+            pipeline_id="99",
+            status="pending",
+        )
+        provider = mock.Mock()
+        provider.list_pending_approvals.return_value = [approval]
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            build_commands.cmd_approve_gate(
+                args,
+                token="token",
+                build_build_provider_func=lambda _token: provider,
+            )
+
+        rendered = json.loads(stdout.getvalue())
+        self.assertEqual(rendered["plan"]["action"], "build.gate.approve")
+        self.assertEqual(rendered["plan"]["target"]["approvalId"], "42")
+        self.assertEqual(rendered["plan"]["payload"]["comment"], "Ship it")
+        self.assertEqual(rendered["plan"]["payload"]["pendingApproval"], approval.to_legacy_dict())
+        self.assertEqual(rendered["applyArgument"], f"--apply {rendered['planId']}")
+        provider.approve_pending_approval.assert_not_called()
+
+    def test_cmd_approve_gate_applies_only_exact_plan_id(self):
+        approval = workflow_models.PendingBuildApproval(
+            id="42",
+            pipeline_id="99",
+            status="pending",
+        )
+        plan = self._approve_gate_plan(approval, comment="Ship it")
+        args = argparse.Namespace(
+            build_id=99,
+            project="Example Project",
+            approval="42",
+            comment="Ship it",
+            json=False,
+            apply=plan.plan_id,
+        )
+        provider = mock.Mock()
+        provider.list_pending_approvals.return_value = [approval]
+        provider.approve_pending_approval.return_value = True
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            build_commands.cmd_approve_gate(
+                args,
+                token="token",
+                build_build_provider_func=lambda _token: provider,
+            )
+
         provider.approve_pending_approval.assert_called_once_with(
             project="Example Project",
             approval_id="42",
-            comment="Approved via CLI",
+            comment="Ship it",
         )
-        rendered = stdout.getvalue()
-        self.assertIn("Pending approvals", rendered)
-        self.assertIn("Approved 42.", rendered)
-        self.assertIn("reason: waiting for approval: ManualValidation", rendered)
+        self.assertIn("Approved 42 for build 99", stdout.getvalue())
+
+    def test_cmd_approve_gate_rejects_changed_plan_without_mutation(self):
+        approval = workflow_models.PendingBuildApproval(
+            id="42",
+            pipeline_id="99",
+            status="pending",
+        )
+        approved_plan = self._approve_gate_plan(approval, comment="Original approval")
+        args = argparse.Namespace(
+            build_id=99,
+            project="Example Project",
+            approval="42",
+            comment="Changed approval",
+            json=False,
+            apply=approved_plan.plan_id,
+        )
+        provider = mock.Mock()
+        provider.list_pending_approvals.return_value = [approval]
+
+        with self.assertRaisesRegex(CliError, "does not match"):
+            build_commands.cmd_approve_gate(
+                args,
+                token="token",
+                build_build_provider_func=lambda _token: provider,
+            )
+
+        provider.list_pending_approvals.assert_called_once_with(
+            project="Example Project",
+            build_id=99,
+        )
+        provider.approve_pending_approval.assert_not_called()
 
     def test_cmd_build_status_watch_prints_only_changed_lines_by_default(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=True, approve=False, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=5)
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=True, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=5)
         snapshot_waiting = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -504,7 +693,7 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn("failure: ValueError: bad asset name", rendered)
 
     def test_cmd_build_status_watch_verbose_repeats_full_snapshots(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=True, approve=False, verbose=True, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=5)
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=True, verbose=True, show_log_ids=False, stage=None, only_failed=False, only_active=False, interval=5)
         snapshot_running = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -582,7 +771,7 @@ class BuildCommandTests(unittest.TestCase):
         self.assertEqual(rendered.count("Install deps"), 2)
 
     def test_cmd_build_status_can_filter_to_stage_and_failed_tasks(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=False, approve=False, verbose=False, show_log_ids=True, stage="Deploy", only_failed=True, only_active=False, interval=60)
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=False, verbose=False, show_log_ids=True, stage="Deploy", only_failed=True, only_active=False, interval=60)
         snapshot = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -637,7 +826,7 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn("reason: waiting on upstream dependency", rendered)
 
     def test_cmd_build_status_can_filter_to_active_items(self):
-        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=False, approve=False, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=True, interval=60)
+        args = argparse.Namespace(build_id=99, project="Example Project", limit=3, json=False, watch=False, verbose=False, show_log_ids=False, stage=None, only_failed=False, only_active=True, interval=60)
         snapshot = workflow_models.BuildStatusSnapshot(
             build=workflow_models.BuildRun(
                 id=99,
@@ -681,12 +870,89 @@ class BuildCommandTests(unittest.TestCase):
         rendered = stdout.getvalue()
         self.assertIn("reason: waiting on task execution: Deploy app", rendered)
 
-    def test_cmd_queue_build_uses_build_provider(self):
+    def test_cmd_queue_build_preview_binds_recent_duplicate_snapshot(self):
         args = argparse.Namespace(
             definition=123,
             project="Example Project",
             branch=None,
+            commit=None,
             parameters='{"env":"dev"}',
+            json=True,
+            apply=None,
+            allow_duplicate=False,
+        )
+        provider = mock.Mock()
+        provider.list_recent_builds.return_value = []
+        provider_factory = mock.Mock(return_value=provider)
+        current_branch = mock.Mock(return_value="main")
+        commit_resolver = mock.Mock(return_value=SOURCE_VERSION)
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            build_commands.cmd_queue_build(
+                args,
+                token="token",
+                build_build_provider_func=provider_factory,
+                current_git_branch_func=current_branch,
+                resolve_git_commit_func=commit_resolver,
+            )
+
+        rendered = json.loads(stdout.getvalue())
+        self.assertEqual(rendered["plan"]["action"], "build.queue")
+        self.assertEqual(rendered["plan"]["target"]["definitionId"], 123)
+        self.assertEqual(rendered["plan"]["payload"], {
+            "allowDuplicate": False,
+            "parameters": {"env": "dev"},
+            "recentDuplicates": [],
+            "sourceBranch": "refs/heads/main",
+            "sourceVersion": SOURCE_VERSION,
+        })
+        self.assertEqual(rendered["applyArgument"], f"--apply {rendered['planId']}")
+        provider_factory.assert_called_once_with("token")
+        provider.list_recent_builds.assert_called_once_with(
+            definition=123,
+            project="Example Project",
+            branch="refs/heads/main",
+            commit=SOURCE_VERSION,
+            limit=5,
+        )
+        current_branch.assert_called_once_with()
+        commit_resolver.assert_called_once_with("HEAD")
+
+    def test_cmd_queue_build_requires_a_resolved_branch_and_object_parameters(self):
+        base_args = dict(
+            definition=123,
+            project="Example Project",
+            branch=None,
+            commit=None,
+            json=False,
+            apply=None,
+        )
+        with self.assertRaisesRegex(CliError, "Pass --branch explicitly"):
+            build_commands.cmd_queue_build(
+                argparse.Namespace(**base_args, parameters=None),
+                token="token",
+                build_build_provider_func=mock.Mock(),
+                current_git_branch_func=lambda: None,
+            )
+
+        with self.assertRaisesRegex(CliError, "JSON object"):
+            build_commands.cmd_queue_build(
+                argparse.Namespace(**base_args, parameters='["dev"]'),
+                token="token",
+                build_build_provider_func=mock.Mock(),
+                current_git_branch_func=lambda: "main",
+            )
+
+    def test_cmd_queue_build_applies_only_exact_plan_id(self):
+        plan = self._queue_build_plan(parameters={"env": "dev"})
+        args = argparse.Namespace(
+            definition=123,
+            project="Example Project",
+            branch=None,
+            commit=None,
+            parameters='{"env":"dev"}',
+            json=False,
+            apply=plan.plan_id,
         )
         provider = mock.Mock()
         provider.list_recent_builds.return_value = []
@@ -702,76 +968,189 @@ class BuildCommandTests(unittest.TestCase):
                 token="token",
                 build_build_provider_func=lambda _token: provider,
                 current_git_branch_func=lambda: "main",
-                current_git_commit_func=lambda: "abcdef123456",
+                resolve_git_commit_func=lambda _ref: SOURCE_VERSION,
             )
 
         provider.list_recent_builds.assert_called_once_with(
             definition=123,
             project="Example Project",
             branch="refs/heads/main",
-            commit="abcdef123456",
+            commit=SOURCE_VERSION,
             limit=5,
         )
         provider.queue_build.assert_called_once_with(
             definition=123,
             project="Example Project",
             source_branch="refs/heads/main",
+            source_version=SOURCE_VERSION,
             parameters={"env": "dev"},
         )
         self.assertIn("Queued build 77", stdout.getvalue())
 
-    def test_cmd_queue_build_warns_about_recent_duplicates(self):
+    def test_cmd_queue_build_rejects_changed_plan_after_binding_duplicate_snapshot(self):
+        approved_plan = self._queue_build_plan(parameters={"env": "dev"})
         args = argparse.Namespace(
             definition=123,
             project="Example Project",
             branch=None,
-            parameters=None,
+            commit=None,
+            parameters='{"env":"prod"}',
+            json=False,
+            apply=approved_plan.plan_id,
         )
         provider = mock.Mock()
-        provider.list_recent_builds.return_value = [
-            workflow_models.BuildRun(
-                id=88,
-                build_number="20260728.2",
-                status="completed",
-                result="succeeded",
-                source_branch="refs/heads/main",
-                queued_at="2026-07-28T10:00:00Z",
-                reason="batchedCI",
-                source_version="abcdef123456",
+        provider.list_recent_builds.return_value = []
+        provider_factory = mock.Mock(return_value=provider)
+        commit_resolver = mock.Mock(return_value=SOURCE_VERSION)
+
+        with self.assertRaisesRegex(CliError, "does not match"):
+            build_commands.cmd_queue_build(
+                args,
+                token="token",
+                build_build_provider_func=provider_factory,
+                current_git_branch_func=lambda: "main",
+                resolve_git_commit_func=commit_resolver,
             )
-        ]
+
+        provider_factory.assert_called_once_with("token")
+        commit_resolver.assert_called_once_with("HEAD")
+
+    def test_cmd_queue_build_rejects_a_commit_changed_since_preview(self):
+        approved_plan = self._queue_build_plan(source_version=SOURCE_VERSION)
+        args = argparse.Namespace(
+            definition=123,
+            project="Example Project",
+            branch=None,
+            commit=None,
+            parameters=None,
+            json=False,
+            apply=approved_plan.plan_id,
+        )
+        provider = mock.Mock()
+        provider.list_recent_builds.return_value = []
+        provider_factory = mock.Mock(return_value=provider)
+
+        with self.assertRaisesRegex(CliError, "does not match"):
+            build_commands.cmd_queue_build(
+                args,
+                token="token",
+                build_build_provider_func=provider_factory,
+                current_git_branch_func=lambda: "main",
+                resolve_git_commit_func=lambda _ref: UPDATED_SOURCE_VERSION,
+            )
+
+        provider_factory.assert_called_once_with("token")
+
+    def test_cmd_queue_build_rejects_an_unresolvable_explicit_commit(self):
+        args = argparse.Namespace(
+            definition=123,
+            project="Example Project",
+            branch="release",
+            commit="ambiguous-prefix",
+            parameters=None,
+            json=False,
+            apply=None,
+        )
+        provider_factory = mock.Mock()
+        commit_resolver = mock.Mock(
+            side_effect=CliError("ERROR: Could not resolve Git commit reference 'ambiguous-prefix'.")
+        )
+
+        with self.assertRaisesRegex(CliError, "Could not resolve Git commit"):
+            build_commands.cmd_queue_build(
+                args,
+                token="token",
+                build_build_provider_func=provider_factory,
+                current_git_branch_func=mock.Mock(),
+                resolve_git_commit_func=commit_resolver,
+            )
+
+        commit_resolver.assert_called_once_with("ambiguous-prefix")
+        provider_factory.assert_not_called()
+
+    def test_cmd_queue_build_requires_explicitly_approved_duplicate(self):
+        duplicate = workflow_models.BuildRun(
+            id=88,
+            build_number="20260728.2",
+            status="completed",
+            result="succeeded",
+            source_branch="refs/heads/main",
+            queued_at="2026-07-28T10:00:00Z",
+            reason="batchedCI",
+            source_version="abcdef123456",
+        )
+        duplicate_snapshot = [{
+            "id": 88,
+            "buildNumber": "20260728.2",
+            "status": "completed",
+            "result": "succeeded",
+            "reason": "batchedCI",
+        }]
+        args = argparse.Namespace(
+            definition=123,
+            project="Example Project",
+            branch=None,
+            commit=None,
+            parameters=None,
+            json=False,
+            apply=None,
+            allow_duplicate=False,
+        )
+        provider = mock.Mock()
+        provider.list_recent_builds.return_value = [duplicate]
         provider.queue_build.return_value = workflow_models.QueuedBuild(
             id=89,
             build_number="20260728.3",
             source_branch="refs/heads/main",
         )
 
+        with self.assertRaisesRegex(CliError, "--allow-duplicate"):
+            build_commands.cmd_queue_build(
+                args,
+                token="token",
+                build_build_provider_func=lambda _token: provider,
+                current_git_branch_func=lambda: "main",
+                resolve_git_commit_func=lambda _ref: SOURCE_VERSION,
+            )
+
+        provider.queue_build.assert_not_called()
+
+        args.allow_duplicate = True
+        args.apply = self._queue_build_plan(
+            allow_duplicate=True,
+            recent_duplicates=duplicate_snapshot,
+        ).plan_id
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             build_commands.cmd_queue_build(
                 args,
                 token="token",
                 build_build_provider_func=lambda _token: provider,
                 current_git_branch_func=lambda: "main",
-                current_git_commit_func=lambda: "abcdef123456",
+                resolve_git_commit_func=lambda _ref: SOURCE_VERSION,
             )
 
         rendered = stdout.getvalue()
-        self.assertIn("Warning: recent builds already exist", rendered)
+        self.assertIn("Approved duplicate queue", rendered)
         self.assertIn("88 reason=batchedCI", rendered)
 
-    def test_cmd_queue_build_skips_duplicate_check_for_explicit_branch(self):
+    def test_cmd_queue_build_resolves_and_checks_an_explicit_branch_commit(self):
         args = argparse.Namespace(
             definition=123,
             project="Example Project",
             branch="release",
+            commit=None,
             parameters=None,
+            json=False,
+            apply=self._queue_build_plan(source_branch="refs/heads/release").plan_id,
         )
         provider = mock.Mock()
+        provider.list_recent_builds.return_value = []
         provider.queue_build.return_value = workflow_models.QueuedBuild(
             id=77,
             build_number="20260728.3",
             source_branch="refs/heads/release",
         )
+        commit_resolver = mock.Mock(return_value=SOURCE_VERSION)
 
         with contextlib.redirect_stdout(io.StringIO()):
             build_commands.cmd_queue_build(
@@ -779,13 +1158,53 @@ class BuildCommandTests(unittest.TestCase):
                 token="token",
                 build_build_provider_func=lambda _token: provider,
                 current_git_branch_func=lambda: "main",
-                current_git_commit_func=lambda: "abcdef123456",
+                resolve_git_commit_func=commit_resolver,
             )
 
-        provider.list_recent_builds.assert_not_called()
+        commit_resolver.assert_called_once_with("release")
+        provider.list_recent_builds.assert_called_once_with(
+            definition=123,
+            project="Example Project",
+            branch="refs/heads/release",
+            commit=SOURCE_VERSION,
+            limit=5,
+        )
 
 
 class AzureDevOpsBuildProviderTests(unittest.TestCase):
+    def test_queue_build_posts_the_pinned_source_version(self):
+        provider = AzureDevOpsBuildProvider("token")
+        response = {
+            "id": 77,
+            "buildNumber": "20260808.1",
+            "sourceBranch": "refs/heads/main",
+        }
+
+        with mock.patch(
+            "providers.azure_devops.build_provider.api",
+            return_value=response,
+        ) as api_mock:
+            queued = provider.queue_build(
+                definition=4832,
+                project="Example Project",
+                source_branch="refs/heads/main",
+                source_version=SOURCE_VERSION,
+                parameters={"environment": "staging"},
+            )
+
+        api_mock.assert_called_once()
+        token, method, url, payload = api_mock.call_args.args
+        self.assertEqual(token, "token")
+        self.assertEqual(method, "POST")
+        self.assertIn("/Example%20Project/_apis/build/builds", url)
+        self.assertEqual(payload, {
+            "definition": {"id": 4832},
+            "sourceBranch": "refs/heads/main",
+            "sourceVersion": SOURCE_VERSION,
+            "templateParameters": {"environment": "staging"},
+        })
+        self.assertEqual(queued.id, 77)
+
     def test_list_recent_builds_filters_branch_and_commit_and_preserves_reason(self):
         provider = AzureDevOpsBuildProvider("token")
         payload = {

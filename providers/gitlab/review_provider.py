@@ -390,6 +390,24 @@ class GitLabReviewProvider:
             )
         return project
 
+    def _fetch_source_ref_tip(self, repository: RepositoryRef, source_ref_name: str) -> str:
+        project_ref = repository.id or repository.project
+        if not project_ref:
+            raise CliError("ERROR: GitLab project identity is required to resolve a source branch.")
+        branch = self._request_json(
+            GITLAB_BASE_URL,
+            f"/projects/{urllib.parse.quote(project_ref, safe='')}/repository/branches/"
+            f"{urllib.parse.quote(source_ref_name, safe='')}",
+            allow_not_found=True,
+        )
+        commit_id = ((branch or {}).get("commit") or {}).get("id")
+        if branch is None or (branch.get("name") and branch.get("name") != source_ref_name) or not commit_id:
+            raise CliError(
+                f"ERROR: GitLab source branch '{source_ref_name}' was not found in "
+                f"project '{repository.project or repository.name}'."
+            )
+        return commit_id
+
     def _build_change_request(self, merge_request: dict, *, base_url: str, project_path: str) -> ChangeRequest:
         project_ref = urllib.parse.quote(project_path, safe="")
         author = (merge_request.get("author") or {}).get("name") or (merge_request.get("author") or {}).get("username") or "unknown"
@@ -766,7 +784,7 @@ class GitLabReviewProvider:
         work_item_title: str | None,
     ) -> tuple[RepositoryRef, dict]:
         project = self._resolve_repository(repo_ref)
-        source = source_branch or current_git_branch()
+        source = source_branch or current_git_branch() or ""
         if source.startswith("refs/heads/"):
             source = source[len("refs/heads/"):]
         if not source or source == "HEAD":
@@ -774,7 +792,7 @@ class GitLabReviewProvider:
 
         target = target_branch or project.get("default_branch") or "main"
         resolved_title = title or (f"[{work_item_id}] {work_item_title}" if work_item_title else f"Issue #{work_item_id}")
-        payload = {
+        form_data = {
             "title": resolved_title,
             "description": description or f"Closes #{work_item_id}",
             "source_branch": source,
@@ -782,14 +800,22 @@ class GitLabReviewProvider:
             "remove_source_branch": True,
         }
         project_path = project.get("path_with_namespace") or repo_ref or "?"
-        return (
-            RepositoryRef(
-                id=str(project.get("id")) if project.get("id") is not None else project_path,
-                name=project.get("path") or project_path.rsplit("/", 1)[-1],
-                project=project_path,
-            ),
-            payload,
+        repository = RepositoryRef(
+            id=str(project.get("id")) if project.get("id") is not None else project_path,
+            name=project.get("path") or project_path.rsplit("/", 1)[-1],
+            project=project_path,
         )
+        source_commit_id = self._fetch_source_ref_tip(repository, source)
+        return repository, {
+            "request": {
+                "method": "POST",
+                "formData": form_data,
+            },
+            "sourceRef": {
+                "name": source,
+                "commitId": source_commit_id,
+            },
+        }
 
     def create_change_request(
         self,
@@ -811,12 +837,47 @@ class GitLabReviewProvider:
             description=description,
             work_item_title=work_item_title,
         )
+        return self.create_prepared_change_request(repository, payload)
+
+    def create_prepared_change_request(
+        self,
+        repository: RepositoryRef,
+        payload: dict,
+    ) -> ChangeRequest:
+        request = payload.get("request") or {}
+        source_ref = payload.get("sourceRef") or {}
+        form_data = request.get("formData")
+        source_ref_name = source_ref.get("name")
+        expected_commit_id = source_ref.get("commitId")
+        if request.get("method") != "POST" or not isinstance(form_data, dict):
+            raise CliError("ERROR: Prepared GitLab change request does not contain exact POST form data.")
+        if (
+            not isinstance(source_ref_name, str)
+            or not isinstance(expected_commit_id, str)
+            or form_data.get("source_branch") != source_ref_name
+        ):
+            raise CliError("ERROR: Prepared GitLab change request has an invalid source-ref precondition.")
+        current_commit_id = self._fetch_source_ref_tip(repository, source_ref_name)
+        if current_commit_id != expected_commit_id:
+            raise CliError(
+                f"ERROR: GitLab source branch '{source_ref_name}' moved after preview; "
+                "generate and approve a fresh plan."
+            )
         result = self._request_json(
             GITLAB_BASE_URL,
             f"/projects/{urllib.parse.quote(repository.id or repository.project or '', safe='')}/merge_requests",
             method="POST",
-            form_data=payload,
+            form_data=form_data,
         )
+        created_commit_id = result.get("sha") if isinstance(result, dict) else None
+        if created_commit_id != expected_commit_id:
+            merge_request_id = result.get("iid", "?") if isinstance(result, dict) else "?"
+            observed = created_commit_id or "not returned by GitLab"
+            raise CliError(
+                f"ERROR: GitLab created merge request {merge_request_id}, but its source commit "
+                f"is {observed} instead of approved commit {expected_commit_id}. Do not retry; "
+                "inspect the created merge request and source branch first."
+            )
         return self._build_change_request(
             result,
             base_url=GITLAB_BASE_URL,
@@ -827,11 +888,19 @@ class GitLabReviewProvider:
         return ReviewMutationPreview(payload={"body": text})
 
     def create_review_comment(self, context: ReviewContext, *, text: str) -> ReviewMutationResult:
+        preview = self.prepare_review_comment(context, text=text)
+        return self.create_prepared_review_comment(context, preview)
+
+    def create_prepared_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
         discussion = self._request_json(
             context.organization,
             f"/projects/{urllib.parse.quote(self._project_api_ref(context), safe='')}/merge_requests/{context.change_request.id}/discussions",
             method="POST",
-            form_data={"body": text},
+            form_data=preview.payload,
         )
         first_note = (discussion.get("notes") or [{}])[0]
         return ReviewMutationResult(thread_id=discussion.get("id"), comment_id=first_note.get("id"))
@@ -848,17 +917,27 @@ class GitLabReviewProvider:
         )
 
     def create_inline_review_comment(self, context: ReviewContext, *, text: str, file_path: str, line: int, end_line: int | None, start_offset: int, end_offset: int | None) -> ReviewMutationResult:
+        preview = self.prepare_inline_review_comment(
+            context,
+            text=text,
+            file_path=file_path,
+            line=line,
+            end_line=end_line,
+            start_offset=start_offset,
+            end_offset=end_offset,
+        )
+        return self.create_prepared_inline_review_comment(context, preview)
+
+    def create_prepared_inline_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
         discussion = self._request_json(
             context.organization,
             f"/projects/{urllib.parse.quote(self._project_api_ref(context), safe='')}/merge_requests/{context.change_request.id}/discussions",
             method="POST",
-            form_data=self._build_inline_discussion_payload(
-                context,
-                text=text,
-                file_path=file_path,
-                line=line,
-                end_line=end_line,
-            ),
+            form_data=preview.payload,
         )
         first_note = (discussion.get("notes") or [{}])[0]
         return ReviewMutationResult(thread_id=discussion.get("id"), comment_id=first_note.get("id"))
@@ -867,13 +946,28 @@ class GitLabReviewProvider:
         return ReviewMutationPreview(payload={"body": text}, thread_id=thread_id, comment_id=parent_comment_id)
 
     def create_review_reply(self, context: ReviewContext, *, thread_id: int | str, text: str, parent_comment_id: int | None) -> ReviewMutationResult:
+        preview = self.prepare_review_reply(
+            context,
+            thread_id=thread_id,
+            text=text,
+            parent_comment_id=parent_comment_id,
+        )
+        return self.create_prepared_review_reply(context, preview)
+
+    def create_prepared_review_reply(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
+        if preview.thread_id is None:
+            raise CliError("ERROR: Prepared review reply is missing a thread id.")
         note = self._request_json(
             context.organization,
-            self._discussion_notes_path(context, thread_id),
+            self._discussion_notes_path(context, preview.thread_id),
             method="POST",
-            form_data={"body": text},
+            form_data=preview.payload,
         )
-        return ReviewMutationResult(thread_id=thread_id, comment_id=note.get("id"))
+        return ReviewMutationResult(thread_id=preview.thread_id, comment_id=note.get("id"))
 
     def prepare_review_comment_edit(self, context: ReviewContext, *, thread_id: int | str, comment_id: int, text: str) -> ReviewMutationPreview:
         discussion = self._fetch_discussion(context, thread_id)
@@ -894,6 +988,21 @@ class GitLabReviewProvider:
         )
         return ReviewMutationResult(thread_id=thread_id, comment_id=comment_id)
 
+    def edit_prepared_review_comment(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
+        if preview.thread_id is None or preview.comment_id is None:
+            raise CliError("ERROR: Prepared comment edit is missing thread or comment identity.")
+        self._request_json(
+            context.organization,
+            self._discussion_note_path(context, preview.thread_id, preview.comment_id),
+            method="PUT",
+            form_data=preview.payload,
+        )
+        return ReviewMutationResult(thread_id=preview.thread_id, comment_id=preview.comment_id)
+
     def prepare_review_thread_resolution(self, context: ReviewContext, *, thread_id: int | str, status: str) -> ReviewMutationPreview:
         discussion = self._fetch_discussion(context, thread_id)
         current_status = "resolved" if discussion.get("resolved") else "active"
@@ -912,5 +1021,23 @@ class GitLabReviewProvider:
         )
         return ReviewMutationResult(
             thread_id=thread_id,
+            status="resolved" if discussion.get("resolved") else "active",
+        )
+
+    def resolve_prepared_review_thread(
+        self,
+        context: ReviewContext,
+        preview: ReviewMutationPreview,
+    ) -> ReviewMutationResult:
+        if preview.thread_id is None:
+            raise CliError("ERROR: Prepared thread resolution is missing a thread id.")
+        discussion = self._request_json(
+            context.organization,
+            self._discussion_path(context, preview.thread_id),
+            method="PUT",
+            form_data=preview.payload,
+        )
+        return ReviewMutationResult(
+            thread_id=preview.thread_id,
             status="resolved" if discussion.get("resolved") else "active",
         )
