@@ -30,6 +30,33 @@ def sprint_fixture() -> workflow_models.Sprint:
     )
 
 
+def start_work_plan_fixture() -> workflow_models.StartWorkPlan:
+    return workflow_models.StartWorkPlan(
+        work_item=workflow_models.TrackedWorkItem(
+            id=135821,
+            title="Fix global filters",
+            kind="Bug",
+            state="Ready for development",
+            assignee="Alice",
+            iteration="Sprint 1",
+            area="Example",
+            estimate=3,
+            labels=["rpp"],
+        ),
+        branch_name="fix/135821-fix-global-filters",
+        note_path=".agent-notes/135821-fix-global-filters.md",
+        commit_prefix="fix: 135821 ",
+        change_request_title="[135821] Fix global filters",
+        concise_title="Fix global filters",
+        change_request_body="Closes #135821",
+        commands=[
+            "git checkout main && git pull",
+            "git checkout -b fix/135821-fix-global-filters",
+            "git push -u origin fix/135821-fix-global-filters",
+        ],
+    )
+
+
 class WorkItemTests(unittest.TestCase):
     def test_suggest_start_work_plan_for_bug_uses_fix_prefix(self):
         item = {
@@ -161,8 +188,9 @@ class WorkItemTests(unittest.TestCase):
         self.assertEqual(resolved, "Resolved")
 
     def test_cmd_start_prefers_actual_provider_state_name_in_output(self):
-        args = argparse.Namespace(id=135821, branch=None)
+        args = argparse.Namespace(id=135821, branch=None, apply=True)
         provider = mock.Mock()
+        provider.get_start_work_plan.return_value = start_work_plan_fixture()
         provider.transition_work_item.return_value = "Active"
         cmd_show = mock.Mock()
 
@@ -640,9 +668,10 @@ class WorkItemTests(unittest.TestCase):
         self.assertEqual(rendered["items"][0]["workItemType"], "Bug")
         self.assertEqual(rendered["groups"][0]["ids"], [1])
 
-    def test_cmd_start_uses_work_tracking_provider_transition(self):
-        args = argparse.Namespace(id=135821, branch=None)
+    def test_cmd_start_defaults_to_plan_without_transition(self):
+        args = argparse.Namespace(id=135821, branch=None, apply=False)
         provider = mock.Mock()
+        provider.get_start_work_plan.return_value = start_work_plan_fixture()
         cmd_show = mock.Mock()
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -653,9 +682,10 @@ class WorkItemTests(unittest.TestCase):
                 cmd_show_func=cmd_show,
             )
 
-        provider.transition_work_item.assert_called_once_with(item_id=135821, state="In Progress")
+        provider.transition_work_item.assert_not_called()
         cmd_show.assert_called_once_with(args, "token")
-        self.assertIn("moved to 'In Progress'", stdout.getvalue())
+        self.assertIn("fix/135821-fix-global-filters", stdout.getvalue())
+        self.assertIn("Preview only", stdout.getvalue())
 
     def test_cmd_testing_requires_qa_email(self):
         args = argparse.Namespace(id=135821, qa=None)
@@ -672,7 +702,7 @@ class WorkItemTests(unittest.TestCase):
         self.assertIn("No QA email set", str(exc.exception))
 
     def test_cmd_review_uses_work_tracking_provider_transition(self):
-        args = argparse.Namespace(id=135821)
+        args = argparse.Namespace(id=135821, apply=True)
         provider = mock.Mock()
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -684,6 +714,21 @@ class WorkItemTests(unittest.TestCase):
 
         provider.transition_work_item.assert_called_once_with(item_id=135821, state="In Review")
         self.assertIn("moved to 'In Review'", stdout.getvalue())
+
+    def test_cmd_review_defaults_to_plan_without_transition(self):
+        args = argparse.Namespace(id=135821, apply=False)
+        provider = mock.Mock()
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            work_item_commands.cmd_review(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+
+        provider.transition_work_item.assert_not_called()
+        self.assertIn("Plan: move work item 135821", stdout.getvalue())
+        self.assertIn("Preview only", stdout.getvalue())
 
     def test_cmd_testing_uses_work_tracking_provider_transition(self):
         args = argparse.Namespace(id=135821, qa="qa@example.com")
@@ -848,7 +893,7 @@ class WorkItemTests(unittest.TestCase):
         provider.get_triage_report.assert_called_once_with(item_ids=[316043, 316044])
 
     def test_cmd_comment_uses_work_tracking_provider(self):
-        args = argparse.Namespace(id=135821, text="Please add repro details.")
+        args = argparse.Namespace(id=135821, text="Please add repro details.", apply=True)
         provider = mock.Mock()
         provider.add_work_item_comment.return_value = 5889999
 
@@ -864,6 +909,21 @@ class WorkItemTests(unittest.TestCase):
             text="Please add repro details.",
         )
         self.assertIn("comment id: 5889999", stdout.getvalue())
+
+    def test_cmd_comment_defaults_to_plan_without_posting(self):
+        args = argparse.Namespace(id=135821, text="Please add repro details.", apply=False)
+        provider = mock.Mock()
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            work_item_commands.cmd_comment(
+                args,
+                token="token",
+                build_work_tracking_provider_func=lambda _token: provider,
+            )
+
+        provider.add_work_item_comment.assert_not_called()
+        self.assertIn("Please add repro details.", stdout.getvalue())
+        self.assertIn("Preview only", stdout.getvalue())
 
     def test_cmd_sprint_json_uses_work_tracking_provider(self):
         args = argparse.Namespace(json=True)

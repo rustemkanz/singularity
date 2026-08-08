@@ -211,7 +211,7 @@ class GitLabWorkTrackingProvider(GitLabReviewProvider, WorkTrackingProvider):
             change_request_body=pr_body,
             commands=[
                 f"git checkout -b {branch_name}",
-                f"./sg create-pr {item_id} --provider gitlab --repo {project_path} --source {branch_name} --work-item-title {tracked.title!r}",
+                f"sg create-pr {item_id} --provider gitlab --repo {project_path} --source {branch_name} --work-item-title {tracked.title!r}",
             ],
         )
 

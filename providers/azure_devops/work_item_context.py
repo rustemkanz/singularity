@@ -29,6 +29,8 @@ from workflow_models import (
 
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+DOWNLOAD_TIMEOUT_SECONDS = 30
+MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 IMAGE_URL_PATTERN = re.compile(
     r"https?://[^\"'\s>]+?(?:\.png|\.jpg|\.jpeg|\.gif|\.webp|\.bmp|\.svg)(?:\?[^\"'\s>]*)?",
     re.IGNORECASE,
@@ -184,6 +186,52 @@ def unique_download_path(download_dir: str, filename: str) -> str:
         candidate = os.path.join(download_dir, f"{base}-{counter}{ext}")
         counter += 1
     return candidate
+
+
+def is_trusted_azure_devops_url(url: str, org_name: str | None = None) -> bool:
+    """Return whether an URL is inside the configured Azure DevOps auth scope."""
+    configured_org = ORG if org_name is None else org_name
+    if not configured_org:
+        return False
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return False
+
+    if parsed.scheme.lower() != "https":
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if port not in (None, 443):
+        return False
+
+    hostname = (parsed.hostname or "").casefold()
+    org = configured_org.casefold()
+    if hostname == "dev.azure.com":
+        path_segments = parsed.path.split("/")
+        if len(path_segments) < 2:
+            return False
+        return urllib.parse.unquote(path_segments[1]).casefold() == org
+
+    return hostname == f"{configured_org}.visualstudio.com".casefold()
+
+
+def read_bounded_download(response, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
+    content_length = response.headers.get("Content-Length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except (TypeError, ValueError):
+            declared_size = None
+        if declared_size is not None and declared_size > max_bytes:
+            raise ValueError(f"Download exceeds the {max_bytes}-byte size limit.")
+
+    payload = response.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError(f"Download exceeds the {max_bytes}-byte size limit.")
+    return payload
 
 
 def build_reference(source: str, label: str, url: str, *, name: str = "", is_image: bool) -> dict:
@@ -607,15 +655,13 @@ def download_reference(
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"Unsupported download URL: {url}")
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "*/*",
-        },
-    )
-    with OPENER.open(req) as resp:
-        payload = resp.read()
+    req = urllib.request.Request(url, headers={"Accept": "*/*"})
+    if is_trusted_azure_devops_url(url):
+        # Keep credentials on the initial request only. urllib's redirect handler
+        # copies regular headers, but intentionally omits unredirected headers.
+        req.add_unredirected_header("Authorization", f"Bearer {token}")
+    with OPENER.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
+        payload = read_bounded_download(resp)
         headers = resp.headers
 
     filename_candidates = [

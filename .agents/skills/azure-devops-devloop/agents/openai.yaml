@@ -1,0 +1,4 @@
+interface:
+  display_name: "Azure DevOps Dev Loop"
+  short_description: "Safely deliver Azure DevOps work items"
+  default_prompt: "Use $azure-devops-devloop to inspect and safely implement Azure DevOps bug 123."

@@ -64,6 +64,59 @@ class SgEntrypointTests(unittest.TestCase):
         help_text = stdout.getvalue()
         self.assertIn("--json", help_text)
 
+    def test_state_changing_workflow_help_exposes_apply_flag(self):
+        for command in ("start", "review", "comment", "create-pr", "prepare-review"):
+            with self.subTest(command=command):
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    with self.assertRaises(SystemExit):
+                        with mock.patch.object(sys, "argv", ["sg", command, "--help"]):
+                            sg.main()
+
+                self.assertIn("--apply", stdout.getvalue())
+
+    def test_pr_creation_help_retains_dry_run_flag(self):
+        for command in ("create-pr", "prepare-review"):
+            with self.subTest(command=command):
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    with self.assertRaises(SystemExit):
+                        with mock.patch.object(sys, "argv", ["sg", command, "--help"]):
+                            sg.main()
+
+                self.assertIn("--dry-run", stdout.getvalue())
+
+    def test_gitlab_cleanup_deletes_branch_with_scoped_authenticated_transport(self):
+        provider = object.__new__(sg.GitLabCleanupProvider)
+        provider.repo = "group/project"
+        provider.work_tracking = mock.Mock()
+        provider.work_tracking._require_project.return_value = "group/project"
+        provider.work_tracking._gitlab_base_url.return_value = "https://gitlab.example.com"
+        provider.review = mock.Mock()
+        provider.review._request_json.side_effect = [
+            {"id": 17},
+            None,
+        ]
+
+        result = provider.cleanup_artifacts(
+            issue_ids=[],
+            merge_request_ids=[],
+            branches=["fix/123-safe-cleanup"],
+        )
+
+        self.assertEqual(result["branches"], ["fix/123-safe-cleanup"])
+        provider.review._request_json.assert_has_calls([
+            mock.call(
+                "https://gitlab.example.com",
+                "/projects/group%2Fproject",
+                allow_not_found=True,
+            ),
+            mock.call(
+                "https://gitlab.example.com",
+                "/projects/17/repository/branches/fix%2F123-safe-cleanup",
+                method="DELETE",
+            ),
+        ])
+        provider.review._request_with_curl.assert_not_called()
+
     def test_show_fails_fast_when_required_config_is_missing(self):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             with self.assertRaises(SystemExit) as exit_context:

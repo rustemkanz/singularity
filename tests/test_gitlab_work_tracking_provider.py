@@ -62,7 +62,7 @@ class GitLabWorkTrackingProviderTests(unittest.TestCase):
             with mock.patch.object(provider, "_resolve_repository", return_value=project):
                 plan = provider.get_start_work_plan(item_id=17)
 
-        self.assertIn("./sg create-pr 17 --provider gitlab --repo group/project", plan.commands[1])
+        self.assertIn("sg create-pr 17 --provider gitlab --repo group/project", plan.commands[1])
         self.assertEqual(plan.branch_name, "issue/17-improve-pipeline-rules")
 
     def test_transition_work_item_updates_workflow_label_and_assignee(self):

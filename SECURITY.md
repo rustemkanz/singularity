@@ -32,9 +32,14 @@ Report them privately to Rustem Kanzafarov at rustem.kanz@gmail.com. If the repo
 ## Operational guidance
 
 - use explicit environment configuration rather than hard-coded credentials
+- configure `GITLAB_BASE_URL` as the exact HTTPS origin that may receive `GITLAB_TOKEN`
+- keep Azure DevOps attachment authentication limited to the configured organization; embedded off-origin URLs should be fetched without credentials
+- use unredirected authorization headers on transports that may follow provider-controlled or content-derived redirects
 - leave TLS verification enabled in normal use
 - treat work-item attachments and screenshots as potentially sensitive
-- review generated external comments before posting when possible
+- review every generated external mutation and use `--apply` only after explicit approval where supported; treat older mutators without it as immediate
+- remember that off-origin work-item media is anonymous but not yet protected by an origin allowlist or private-network deny policy
+- inspect provider state before retrying a failed composite operation such as `prepare-review --apply`
 
 ## Maintainer contact
 

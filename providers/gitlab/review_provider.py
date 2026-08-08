@@ -27,11 +27,36 @@ from workflow_models import (
 )
 
 
+def _normalized_https_origin(url: str, *, origin_only: bool = False) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise CliError(f"ERROR: Invalid GitLab URL '{url}'.") from exc
+
+    if parsed.scheme.lower() != "https" or not parsed.netloc or not parsed.hostname:
+        raise CliError(f"ERROR: GitLab URLs must use HTTPS: '{url}'.")
+    if parsed.username is not None or parsed.password is not None:
+        raise CliError(f"ERROR: GitLab URLs must not contain user information: '{url}'.")
+    if origin_only and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        raise CliError(f"ERROR: GitLab base URLs must contain only an HTTPS origin: '{url}'.")
+
+    try:
+        hostname = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise CliError(f"ERROR: Invalid GitLab URL hostname in '{url}'.") from exc
+    if not hostname:
+        raise CliError(f"ERROR: Invalid GitLab URL hostname in '{url}'.")
+
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    normalized_port = 443 if port is None else port
+    return f"https://{host}" if normalized_port == 443 else f"https://{host}:{normalized_port}"
+
+
 def parse_gitlab_merge_request_url(url: str) -> dict[str, object]:
-    parsed = urllib.parse.urlparse(url)
+    parsed = urllib.parse.urlsplit(url)
     path = urllib.parse.unquote(parsed.path or "").rstrip("/")
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise CliError(f"ERROR: Unsupported GitLab merge request URL '{url}'.")
+    base_url = _normalized_https_origin(url)
 
     marker = "/-/merge_requests/"
     if marker in path:
@@ -46,7 +71,7 @@ def parse_gitlab_merge_request_url(url: str) -> dict[str, object]:
         raise CliError(f"ERROR: Unsupported GitLab merge request URL '{url}'.")
 
     return {
-        "base_url": f"{parsed.scheme}://{parsed.netloc}",
+        "base_url": base_url,
         "project_path": project_path,
         "merge_request_iid": int(iid_text),
     }
@@ -157,12 +182,29 @@ def _position_payload_entry(file_path: str, position: dict[str, int | None], sid
 class GitLabReviewProvider:
     def __init__(self, token: str | None):
         self.token = token
+        self._credential_origin = (
+            _normalized_https_origin(GITLAB_BASE_URL, origin_only=True)
+            if token
+            else None
+        )
 
     def _request_headers(self, *, accept: str) -> dict[str, str]:
-        headers = {"Accept": accept}
+        return {"Accept": accept}
+
+    def _validated_base_url(self, base_url: str) -> str:
+        request_origin = _normalized_https_origin(base_url, origin_only=True)
+        if self._credential_origin and request_origin != self._credential_origin:
+            raise CliError(
+                "ERROR: Refusing to send the GitLab token outside the configured "
+                f"GITLAB_BASE_URL origin '{self._credential_origin}' (requested '{request_origin}')."
+            )
+        return request_origin
+
+    def _add_authentication(self, request: urllib.request.Request) -> None:
         if self.token:
-            headers["PRIVATE-TOKEN"] = self.token
-        return headers
+            # urllib copies normal headers when following redirects. Unredirected
+            # headers apply only to this request, so a redirect cannot carry the token.
+            request.add_unredirected_header("PRIVATE-TOKEN", self.token)
 
     def _curl_binary(self) -> str | None:
         curl_path = shutil.which("curl")
@@ -174,6 +216,12 @@ class GitLabReviewProvider:
         return None
 
     def _request_with_curl(self, base_url: str, path: str, *, method: str = "GET", accept: str, query: dict | None = None, form_data: dict | None = None, allow_not_found: bool = False, allowed_status_codes: set[int] | None = None) -> str | None:
+        if self.token:
+            raise CliError(
+                "ERROR: Authenticated GitLab requests do not use the curl TLS fallback. "
+                "Repair the local Python CA trust configuration and retry."
+            )
+        base_url = self._validated_base_url(base_url)
         curl_path = self._curl_binary()
         if not curl_path:
             raise CliError(
@@ -193,8 +241,6 @@ class GitLabReviewProvider:
             "-w",
             f"\n{marker}%{{http_code}}",
         ]
-        if self.token:
-            command.extend(["-H", f"PRIVATE-TOKEN: {self.token}"])
         payload = _form_payload(form_data)
         if payload:
             command.extend(["-H", "Content-Type: application/x-www-form-urlencoded"])
@@ -233,6 +279,12 @@ class GitLabReviewProvider:
             raise CliError(f"ERROR: GitLab API request failed ({exc.code}): {detail or exc.reason}") from exc
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                if self.token:
+                    raise CliError(
+                        "ERROR: Authenticated GitLab API request failed TLS certificate verification. "
+                        "The curl fallback is disabled for authenticated requests; repair the local "
+                        "Python CA trust configuration and retry."
+                    ) from exc
                 return self._request_with_curl(
                     base_url,
                     path,
@@ -246,6 +298,7 @@ class GitLabReviewProvider:
             raise CliError(f"ERROR: GitLab API request failed: {exc.reason}") from exc
 
     def _request_json(self, base_url: str, path: str, *, method: str = "GET", query: dict | None = None, form_data: dict | None = None, allow_not_found: bool = False, allowed_status_codes: set[int] | None = None):
+        base_url = self._validated_base_url(base_url)
         payload = _form_payload(form_data)
         request = urllib.request.Request(
             _api_url(base_url, path, query),
@@ -253,6 +306,7 @@ class GitLabReviewProvider:
             headers=self._request_headers(accept="application/json"),
             method=method,
         )
+        self._add_authentication(request)
         if payload:
             request.add_header("Content-Type", "application/x-www-form-urlencoded")
         body = self._read_response_body(
@@ -266,16 +320,18 @@ class GitLabReviewProvider:
             query=query,
             form_data=payload,
         )
-        if body is None:
+        if body is None or not body.strip():
             return None
         return json.loads(body)
 
     def _request_text(self, base_url: str, path: str, *, query: dict | None = None, allow_not_found: bool = False, allowed_status_codes: set[int] | None = None):
+        base_url = self._validated_base_url(base_url)
         request = urllib.request.Request(
             _api_url(base_url, path, query),
             headers=self._request_headers(accept="text/plain"),
             method="GET",
         )
+        self._add_authentication(request)
         return self._read_response_body(
             request,
             allow_not_found=allow_not_found,

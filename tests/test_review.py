@@ -15,6 +15,21 @@ from providers.interfaces import RepositoryRef, ReviewAnalysis, ReviewContext, R
 import workflow_models
 
 
+def change_request_fixture() -> workflow_models.ChangeRequest:
+    return workflow_models.ChangeRequest(
+        id=42,
+        title="[135821] Fix global filters",
+        status="active",
+        source_branch="fix/135821",
+        target_branch="main",
+        author="Alice",
+        repo_name="sample-repo",
+        repo_id="repo-1",
+        api_url="https://example.test/pr/42",
+        browser_url="https://example.test/browser/42",
+    )
+
+
 class ReviewTests(unittest.TestCase):
     def test_resolve_repository_uses_default_repo_when_git_repo_missing(self):
         repos = [
@@ -220,6 +235,93 @@ class ReviewTests(unittest.TestCase):
         rendered = json.loads("\n".join(stdout.getvalue().splitlines()[1:]))
         self.assertEqual(rendered["repository"]["name"], "sample-repo")
         provider.prepare_change_request.assert_called_once()
+        provider.create_change_request.assert_not_called()
+
+    def test_cmd_create_pr_defaults_to_plan_without_creation(self):
+        args = argparse.Namespace(
+            id=135821,
+            repo="sample-repo",
+            source="fix/135821",
+            target="main",
+            title=None,
+            description=None,
+            work_item_title=None,
+            dry_run=False,
+            apply=False,
+        )
+        provider = mock.Mock()
+        provider.prepare_change_request.return_value = (
+            RepositoryRef(id="repo-1", name="sample-repo", project="Example Project"),
+            {"title": "[135821] Fix global filters"},
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            review_commands.cmd_create_pr(
+                args,
+                token="token",
+                build_review_provider_func=lambda _token: provider,
+            )
+
+        provider.create_change_request.assert_not_called()
+        self.assertIn("Plan: create PR payload", stdout.getvalue())
+        self.assertIn("Preview only", stdout.getvalue())
+
+    def test_cmd_create_pr_apply_creates_change_request(self):
+        args = argparse.Namespace(
+            id=135821,
+            repo="sample-repo",
+            source="fix/135821",
+            target="main",
+            title=None,
+            description=None,
+            work_item_title=None,
+            dry_run=False,
+            apply=True,
+        )
+        provider = mock.Mock()
+        provider.prepare_change_request.return_value = (
+            RepositoryRef(id="repo-1", name="sample-repo", project="Example Project"),
+            {"title": "[135821] Fix global filters"},
+        )
+        provider.create_change_request.return_value = change_request_fixture()
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            review_commands.cmd_create_pr(
+                args,
+                token="token",
+                build_review_provider_func=lambda _token: provider,
+            )
+
+        provider.create_change_request.assert_called_once()
+        self.assertIn("Pull request created", stdout.getvalue())
+
+    def test_cmd_create_pr_apply_requires_explicit_repo_and_source(self):
+        for repo, source, expected_flag in (
+            (None, "fix/135821", "--repo"),
+            ("sample-repo", None, "--source"),
+        ):
+            with self.subTest(expected_flag=expected_flag):
+                args = argparse.Namespace(
+                    id=135821,
+                    repo=repo,
+                    source=source,
+                    target="main",
+                    title=None,
+                    description=None,
+                    work_item_title=None,
+                    dry_run=False,
+                    apply=True,
+                )
+                provider_factory = mock.Mock()
+
+                with self.assertRaisesRegex(CliError, expected_flag):
+                    review_commands.cmd_create_pr(
+                        args,
+                        token="token",
+                        build_review_provider_func=provider_factory,
+                    )
+
+                provider_factory.assert_not_called()
 
     def test_cmd_prepare_review_dry_run_uses_review_provider(self):
         args = argparse.Namespace(
@@ -248,6 +350,101 @@ class ReviewTests(unittest.TestCase):
         rendered = json.loads("\n".join(stdout.getvalue().splitlines()[1:]))
         self.assertEqual(rendered["repository"]["name"], "sample-repo")
         self.assertEqual(rendered["work_item_transition"]["state"], "In Review")
+        provider.create_change_request.assert_not_called()
+
+    def test_cmd_prepare_review_defaults_to_plan_without_mutation(self):
+        args = argparse.Namespace(
+            id=135821,
+            repo="sample-repo",
+            source="fix/135821",
+            target="main",
+            title=None,
+            description=None,
+            work_item_title=None,
+            dry_run=False,
+            apply=False,
+        )
+        review_provider = mock.Mock()
+        review_provider.prepare_change_request.return_value = (
+            RepositoryRef(id="repo-1", name="sample-repo", project="Example Project"),
+            {"title": "[135821] Fix global filters"},
+        )
+        work_provider_factory = mock.Mock()
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            review_commands.cmd_prepare_review(
+                args,
+                token="token",
+                build_review_provider_func=lambda _token: review_provider,
+                build_work_tracking_provider_func=work_provider_factory,
+            )
+
+        review_provider.create_change_request.assert_not_called()
+        work_provider_factory.assert_not_called()
+        self.assertIn("Plan: prepare-review payload", stdout.getvalue())
+        self.assertIn("Preview only", stdout.getvalue())
+
+    def test_cmd_prepare_review_apply_creates_pr_and_transitions_item(self):
+        args = argparse.Namespace(
+            id=135821,
+            repo="sample-repo",
+            source="fix/135821",
+            target="main",
+            title=None,
+            description=None,
+            work_item_title=None,
+            dry_run=False,
+            apply=True,
+        )
+        review_provider = mock.Mock()
+        review_provider.prepare_change_request.return_value = (
+            RepositoryRef(id="repo-1", name="sample-repo", project="Example Project"),
+            {"title": "[135821] Fix global filters"},
+        )
+        review_provider.create_change_request.return_value = change_request_fixture()
+        work_tracking_provider = mock.Mock()
+        work_tracking_provider.transition_work_item.return_value = "Resolved"
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            review_commands.cmd_prepare_review(
+                args,
+                token="token",
+                build_review_provider_func=lambda _token: review_provider,
+                build_work_tracking_provider_func=lambda _token: work_tracking_provider,
+            )
+
+        review_provider.create_change_request.assert_called_once()
+        work_tracking_provider.transition_work_item.assert_called_once_with(
+            item_id=135821,
+            state="In Review",
+        )
+        self.assertIn("moved to 'Resolved'", stdout.getvalue())
+
+    def test_cmd_prepare_review_apply_requires_explicit_repo_and_source(self):
+        args = argparse.Namespace(
+            id=135821,
+            repo=None,
+            source=None,
+            target="main",
+            title=None,
+            description=None,
+            work_item_title=None,
+            dry_run=False,
+            apply=True,
+        )
+        review_provider_factory = mock.Mock()
+        work_provider_factory = mock.Mock()
+
+        with self.assertRaisesRegex(CliError, "--repo and --source"):
+            review_commands.cmd_prepare_review(
+                args,
+                token="token",
+                build_review_provider_func=review_provider_factory,
+                build_work_tracking_provider_func=work_provider_factory,
+            )
+
+        review_provider_factory.assert_not_called()
+        work_provider_factory.assert_not_called()
 
     def test_cmd_pr_comments_json_serializes_review_threads(self):
         args = argparse.Namespace(json=True, unresolved_only=False, repo=None, pr=None, source=None, url=None)

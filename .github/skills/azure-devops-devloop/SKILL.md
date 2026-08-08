@@ -1,13 +1,13 @@
 ---
 name: azure-devops-devloop
-description: 'Azure DevOps developer workflow skill for agent-assisted delivery. Use when working from Azure DevOps work items, user stories, bugs, PR reviews, review threads, attachments, screenshots, and build follow-up with the local ./sg helper.'
+description: 'Azure DevOps developer workflow skill for safe agent-assisted delivery with Singularity. Use for work items, bugs, user stories, pull requests, review threads, attachments, screenshots, and build follow-up, including prompts such as "using Singularity fix bug 123".'
 argument-hint: 'Describe the work item, PR, or workflow step you want to progress'
 user-invocable: true
 ---
 
 # Azure DevOps Dev Loop
 
-Use this skill when the task is primarily an Azure DevOps workflow task and the local `./sg` helper should drive the next action.
+Use this skill when the task is primarily an Azure DevOps workflow task and `sg` should drive provider operations. Singularity manages workflow state; Copilot inspects and edits the target code repository.
 
 ## When To Use
 
@@ -21,34 +21,42 @@ Use this skill when the task is primarily an Azure DevOps workflow task and the 
 - Replying to review comments or resolving review threads.
 - Checking build status for a PR-related pipeline.
 
-## Core Rule
+## Core Rules
 
-Use the local `./sg` helper before rebuilding raw Azure DevOps REST calls. If the helper lacks a needed action, extend it first when practical.
+- Verify the target checkout with `git rev-parse --show-toplevel`, `git remote -v`, and `git branch --show-current`.
+- Run an installed `sg` command from that checkout. Use this repository's `./sg` only when this is the target repository.
+- Pass explicit `--repo` and `--source` values to PR commands.
+- Treat the initial task as approval for local code work only. Before each external mutation, preview the exact action and ask for explicit approval. Add `--apply` after approval for plan-first commands; do not invoke older immediate mutators before approval.
+- Use Singularity before rebuilding raw Azure DevOps REST calls. If it lacks a needed action, extend it first when practical.
 
 ## Procedure
 
 1. Inspect the work item or PR context before changing code.
 2. If screenshots or pasted UI evidence may matter, fetch attachments locally.
-3. If requirements are unclear, add a clarification comment instead of making speculative changes.
-4. Only move the item to `In Progress` when the request is clear enough to implement.
-5. After implementation and local validation, create or prepare the PR.
-6. Use the PR analysis and PR comment commands for review follow-up instead of guessing the current thread state.
-7. Move the work item forward only when the engineering state actually matches the workflow state.
+3. If requirements are unclear, preview a clarification comment instead of making speculative changes; post it only after approval.
+4. Use plan-only `start-work` or preview `start` to obtain the same canonical branch/state plan. Only `start --apply` changes provider state, and only after approval; neither command creates the local branch.
+5. Create the exact planned branch in the target checkout.
+6. After implementation and local validation, preview a PR with explicit repo and source values; create it only after approval.
+7. Use the PR analysis and PR comment commands for review follow-up instead of guessing the current thread state.
+8. Preview the review transition and apply it only after separate approval. Move the work item forward only when the engineering state matches the workflow state.
 
 ## Common Command Flow
 
 ```bash
-./sg sprint
-./sg ready-items
-./sg show <id>
-./sg comments <id> --latest 5
-./sg attachments <id>
-./sg start <id>
-./sg create-pr <id> --repo <repo> --dry-run
-./sg pr-analyze --url <ado-pr-url>
-./sg pr-comments --url <ado-pr-url> --unresolved-only
-./sg review <id>
-./sg handoff-to-qa <id>
+sg sprint
+sg ready-items
+sg show <id>
+sg comments <id> --latest 5
+sg attachments <id>
+sg start-work <id>
+sg start <id>
+sg start <id> --apply
+sg create-pr <id> --repo <repo> --source <branch>
+sg create-pr <id> --repo <repo> --source <branch> --apply
+sg pr-analyze --url <ado-pr-url>
+sg pr-comments --url <ado-pr-url> --unresolved-only
+sg review <id>
+sg review <id> --apply
 ```
 
 ## Guardrails
@@ -56,6 +64,8 @@ Use the local `./sg` helper before rebuilding raw Azure DevOps REST calls. If th
 - Do not start coding from the work-item title alone.
 - Do not skip attachment review when UI context is likely relevant.
 - Do not move items forward prematurely.
+- Do not infer external-mutation approval from a request to fix or implement an item.
+- Do not reuse one approval for a later comment, transition, PR, review action, pipeline action, or QA handoff.
 - Prefer concise, natural external comments and PR replies.
 - Use `AI-assisted via Copilot.` as the short trailing disclosure when disclosure is needed.
 

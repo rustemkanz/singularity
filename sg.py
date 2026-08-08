@@ -10,21 +10,21 @@ Commands:
     sprint          Show the current sprint
     list            List my open items (New / Ready for development)
     ready-items     Alias for list
-    pick-next       Show or start the next best candidate item
+    pick-next       Show the next candidate and optionally preview its start plan
     show <id>       Show full details of a work item
     comments <id>   Show work-item comments
     context <id>    Show full work-item context including comments and linked dev artifacts
     attachments <id> Show or download attachment and screenshot context
     introduced-by <id> Show linked PR/commit candidates that likely introduced a bug
     triage <ids...> Summarize several work items and suggest grouping for PRs
-    start <id>      Move item to 'In Progress' (prints branch command)
+    start <id>      Preview the canonical start plan; --apply changes state
     start-work <id> Suggest a branch, note path, commit prefix, and PR draft
-    review <id>     Move item to 'In Review'
+    review <id>     Preview moving an item to 'In Review'; --apply changes state
     testing <id>    Move item to 'In Testing' and assign to QA
     handoff-to-qa   Alias for testing
-    create-pr       Create a pull request for a work item
-    prepare-review  Create a PR and move the work item to 'In Review'
-    comment <id>    Add a comment to a work item
+    create-pr       Preview a pull request; --apply creates it
+    prepare-review  Preview PR creation and review handoff; --apply performs both
+    comment <id>    Preview a work-item comment; --apply posts it
     repos           List git repositories in the project
     pr-analyze      Summarize a PR from a URL or repo/PR reference
     pr-files        List changed files for a PR
@@ -281,11 +281,10 @@ class GitLabCleanupProvider:
 
         deleted_branches = []
         for branch in branches:
-            self.review._request_with_curl(
+            self.review._request_json(
                 base_url,
-                f"/projects/{project_id}/repository/branches/{__import__('urllib').parse.quote(branch, safe='')}",
+                f"/projects/{project_id}/repository/branches/{urllib.parse.quote(branch, safe='')}",
                 method="DELETE",
-                accept="application/json",
             )
             deleted_branches.append(branch)
 

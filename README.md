@@ -39,11 +39,11 @@ The current implementation ships the broadest support for Azure DevOps today, al
 - Drafting, posting, editing, replying to, and resolving review comments.
 - Inspecting build status with failure-tail summaries, delta-oriented watch output, visible build reasons, task log ids, stage or active or failed filters, richer pending explanations, direct build step logs, latest matching builds by branch or commit, queueing builds with duplicate-run warnings, and optionally approving pending pipeline gates while watching.
 
-The preferred command entrypoint is the local wrapper `./sg`, which delegates to `sg.py`.
+The source checkout includes a local `./sg` wrapper. For agent-assisted work in another repository, install the package so the `sg` entrypoint can be run from the target code checkout.
 
 GitLab support now covers a practical issue-plus-merge-request loop under the existing provider-neutral commands, while builds and some deeper workflow surfaces still remain Azure DevOps-only.
 
-The repository also includes a repo-local Copilot skill at `.github/skills/azure-devops-devloop/SKILL.md` for on-demand workflow guidance around the helper.
+The repository includes matching repo-local workflow guidance for Codex (`.agents/skills/azure-devops-devloop/SKILL.md` and `AGENTS.md`) and Copilot (`.github/skills/azure-devops-devloop/SKILL.md`). Both keep external mutations behind explicit approval.
 
 For repeatable real-system validation and product demos, see `live-smoke-playbook.md`. It is the canonical disposable end-to-end validation and demo scenario for the current ADO implementation and future provider reference runs.
 
@@ -84,6 +84,16 @@ The next platform milestone is to deepen the GitLab adapter while keeping the ou
 
 The project is currently tested in CI on Python 3.11, 3.12, and 3.13.
 
+### Install the target-checkout entrypoint
+
+From a Singularity clone, install an editable development entrypoint:
+
+```bash
+python -m pip install -e /path/to/singularity
+```
+
+Then change to the code repository that should receive the work and run `sg` there. This keeps git remote and branch inference anchored to the target checkout.
+
 ### Authentication
 
 The helper acquires an Azure DevOps access token through the Azure CLI.
@@ -114,9 +124,10 @@ Optional GitLab configuration for merge-request and issue workflows:
 
 ```bash
 export GITLAB_TOKEN="your-gitlab-token"
+export GITLAB_BASE_URL="https://gitlab.com"
 ```
 
-`GITLAB_TOKEN` is optional for public read-only merge-request inspection. Set it when the target GitLab project is private or your instance requires authenticated API access.
+`GITLAB_TOKEN` is optional for public read-only merge-request inspection. Set it when the target GitLab project is private or your instance requires authenticated API access. When configured, authenticated requests are allowed only to the exact HTTPS origin in `GITLAB_BASE_URL`; a different origin is rejected before network access. Without a token, public read-only requests may use another valid HTTPS GitLab origin anonymously.
 
 For project-local settings, prefer an uncommitted repo file:
 
@@ -124,9 +135,9 @@ For project-local settings, prefer an uncommitted repo file:
 cp .env.local.example .env.local
 ```
 
-`./sg` loads `.env.local` and `.env` from the repository root when present, and shell-exported values still win if both are set.
+The source-checkout `./sg` wrapper loads `.env.local` and `.env` from the Singularity repository root when present, and shell-exported values still win. When running an installed `sg` from another checkout, prefer shell-exported configuration rather than copying provider credentials into the target repository.
 
-For repo-aware commands, Singularity first tries to infer the repo from the current git checkout. If you run the helper from another repo, you can pass `--repo` explicitly or set `AZURE_DEVOPS_DEFAULT_REPO` as the fallback.
+For repo-aware commands, run an installed `sg` entrypoint from the target code checkout. Singularity can infer the repo from that checkout, but mutation workflows should pass `--repo` explicitly; PR workflows should also pass `--source`. Do not run the Singularity source checkout's `./sg` and accidentally infer Singularity itself as the target repository.
 
 To discover the team GUID required for `AZURE_DEVOPS_TEAM_ID`, run:
 
@@ -139,44 +150,60 @@ See `env.example.sh` for a shell-export starter template.
 ### Run the helper
 
 ```bash
-./sg sprint
-./sg ready-items
-./sg show 123456
-./sg comments 123456 --latest 5
-./sg attachments 123456
-./sg start 123456
-./sg create-pr 123456 --repo your-repo --dry-run
+sg sprint
+sg ready-items
+sg show 123456
+sg comments 123456 --latest 5
+sg attachments 123456
+sg start 123456
+# After approving the displayed start plan:
+sg start 123456 --apply
+sg create-pr 123456 --repo your-repo --source fix/123456-example
+# After separately approving the displayed PR payload:
+sg create-pr 123456 --repo your-repo --source fix/123456-example --apply
 ```
+
+### `start-work` versus `start`
+
+Both commands obtain the same provider-generated `StartWorkPlan`, so they cannot independently invent different default branches.
+
+- `start-work <id>` is a read-only planning command. It prints branch, note, commit, and PR metadata, supports `--json`, has no `--apply`, and never changes provider state.
+- `start <id>` shows the work-item context and the same plan. Without `--apply` it is also read-only; with `--apply` it moves the item to `In Progress`. Its optional `--branch` value deliberately overrides the displayed branch plan.
+- Neither command creates or checks out a local git branch. The agent or developer creates the exact planned branch in the verified target checkout.
 
 ### PR inspection
 
 For read-only pull-request inspection, the helper can show changed files, reviewer state, review comments, and attached status checks:
 
 ```bash
-./sg pr-analyze --url <ado-pr-url>
-./sg pr-comments --url <ado-pr-url>
-./sg pr-statuses --url <ado-pr-url>
+sg pr-analyze --url <ado-pr-url>
+sg pr-comments --url <ado-pr-url>
+sg pr-statuses --url <ado-pr-url>
 ```
 
 GitLab preview uses the same review commands with a GitLab merge-request URL:
 
 ```bash
-./sg show 42 --provider gitlab --repo group/project
-./sg comments 42 --provider gitlab --repo group/project
-./sg comment 42 --provider gitlab --repo group/project "Low-risk smoke comment."
-./sg start-work 42 --provider gitlab --repo group/project
-./sg start 42 --provider gitlab --repo group/project --branch issue/42-smoke
-./sg review 42 --provider gitlab --repo group/project
-./sg testing 42 --provider gitlab --repo group/project --qa gitlab-qa-username
-./sg pr-analyze --url https://gitlab.example.com/group/project/-/merge_requests/123
-./sg pr-files --url https://gitlab.example.com/group/project/-/merge_requests/123
-./sg pr-file --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md
-./sg pr-diff --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md
-./sg pr-comment --url https://gitlab.example.com/group/project/-/merge_requests/123 "Please clarify this section."
-./sg pr-inline-comment --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md --line 12 "Inline GitLab note."
-./sg pr-reply --url https://gitlab.example.com/group/project/-/merge_requests/123 --thread <thread-id> "Thanks, updating this."
-./sg create-pr 42 --provider gitlab --repo group/project --source test/42-smoke --work-item-title "Disposable smoke issue"
-./sg cleanup-artifacts --provider gitlab --repo group/project --issue 42 --mr 123 --branch test/42-smoke
+sg show 42 --provider gitlab --repo group/project
+sg comments 42 --provider gitlab --repo group/project
+sg comment 42 --provider gitlab --repo group/project "Low-risk smoke comment."
+sg comment 42 --provider gitlab --repo group/project "Low-risk smoke comment." --apply
+sg start-work 42 --provider gitlab --repo group/project
+sg start 42 --provider gitlab --repo group/project --branch issue/42-smoke
+sg start 42 --provider gitlab --repo group/project --branch issue/42-smoke --apply
+sg review 42 --provider gitlab --repo group/project
+sg review 42 --provider gitlab --repo group/project --apply
+sg testing 42 --provider gitlab --repo group/project --qa gitlab-qa-username
+sg pr-analyze --url https://gitlab.example.com/group/project/-/merge_requests/123
+sg pr-files --url https://gitlab.example.com/group/project/-/merge_requests/123
+sg pr-file --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md
+sg pr-diff --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md
+sg pr-comment --url https://gitlab.example.com/group/project/-/merge_requests/123 "Please clarify this section."
+sg pr-inline-comment --url https://gitlab.example.com/group/project/-/merge_requests/123 --path /README.md --line 12 "Inline GitLab note."
+sg pr-reply --url https://gitlab.example.com/group/project/-/merge_requests/123 --thread <thread-id> "Thanks, updating this."
+sg create-pr 42 --provider gitlab --repo group/project --source test/42-smoke --work-item-title "Disposable smoke issue"
+sg create-pr 42 --provider gitlab --repo group/project --source test/42-smoke --work-item-title "Disposable smoke issue" --apply
+sg cleanup-artifacts --provider gitlab --repo group/project --issue 42 --mr 123 --branch test/42-smoke
 ```
 
 Current GitLab scope is intentionally narrower than Azure DevOps, but it is no longer read-only. GitLab issue inspection, comments, start-work planning, workflow transitions, merge-request creation, top-level review-thread mutations, inline diff comments, and disposable-artifact cleanup are now helper-backed when you pass `--provider gitlab` and an explicit GitLab project path in `--repo`. The existing positional `id` acts as the tracking-item or issue id for title and description defaults in `create-pr`. Public merge-request analysis, files, and diffs are still validated without `GITLAB_TOKEN` on public targets, while `pr-comments` and `pr-statuses` can still require `GITLAB_TOKEN` because GitLab may gate those API endpoints even when the merge request itself is public. Build flows still remain out of scope. The likely GitLab analogue for the ADO work-item loop is issue-plus-merge-request pairing; that loop is now helper-backed through review handoff, but GitLab's own issue APIs did not immediately surface a newly created related merge request during live validation.
@@ -189,14 +216,25 @@ Singularity is intentionally local and approval-aware.
 
 - It can inspect and prepare.
 - It can automate repetitive Azure DevOps mutations.
+- `comment`, `start`, `create-pr`, `prepare-review`, and `review` preview by default and require `--apply` for the external mutation.
+- An agent should show the exact preview and obtain approval for each action; approval for local code work or a prior mutation does not carry forward.
 - It should ask for clarification when requirements are incomplete.
 - It should not silently guess business intent.
 - It should keep human review points before high-impact external actions.
+
+### Known safety boundaries
+
+- The uniform plan/`--apply` contract currently covers `comment`, `start`, `create-pr`, `prepare-review`, and `review`. QA handoff, pipeline queueing, cleanup, and several PR-thread mutators still use older command-specific behavior; some offer `--dry-run`, while others mutate immediately.
+- Preview and apply recompute a plan rather than applying an immutable approved artifact. Explicit `--repo` and `--source` reduce target drift for PR creation, but titles, descriptions, provider state, or other defaults can still change between the two invocations.
+- Off-origin work-item media is downloaded without Azure credentials, but there is not yet an origin allowlist or private/link-local network deny policy. Treat attachment download as network access to work-item-authored URLs.
+- `prepare-review --apply` is a two-step operation, not a transaction. If PR creation succeeds and the work-item transition fails, the PR remains and the operator must inspect provider state before retrying.
 
 ## Safety notes
 
 - Review generated PR titles, descriptions, and external comments before posting when possible.
 - Treat work-item context and linked screenshots as potentially sensitive.
+- Work-item media downloads attach Azure DevOps bearer credentials only to exact trusted HTTPS organization URLs and never forward them across redirects; other embedded URLs are fetched anonymously.
+- GitLab tokens are attached only to the exact HTTPS origin configured by `GITLAB_BASE_URL` and are never forwarded across redirects.
 - Prefer explicit environment configuration over editing source defaults.
 - Keep normal network and certificate verification behavior intact.
 
@@ -268,6 +306,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 - Keep the local CLI as the primary operator surface.
 - Keep the repo-local skill so agents can load the workflow intentionally.
+- Extend the plan/`--apply` contract to every external mutation and bind apply operations to immutable approved plans.
+- Add external-media origin/private-network policy and resumable composite operations.
 - Extract a reusable core service layer from the monolithic script.
 - Deepen the GitLab adapter toward parity with the Azure DevOps workflow surface, including build visibility.
 - Add an MCP wrapper only after the service boundaries are stable.
@@ -278,4 +318,4 @@ If you are evaluating this project for open source, the most accurate framing is
 
 > Singularity is a local, provider-backed delivery workflow CLI for agent-assisted development, not a generalized autonomous developer platform.
 
-Azure DevOps has the broadest workflow coverage today and GitLab covers a practical issue-plus-merge-request loop, but `./sg` is the front door for both; provider-specific capabilities live behind explicit adapters rather than one platform being the default entrypoint. Singularity is also not intended to compete head-on with the official Azure DevOps CLI, Azure DevOps MCP, or the GitLab CLI. It is an opinionated workflow layer built around a narrower developer experience.
+Azure DevOps has the broadest workflow coverage today and GitLab covers a practical issue-plus-merge-request loop, but `sg` is the front door for both; provider-specific capabilities live behind explicit adapters rather than one platform being the default entrypoint. Singularity is also not intended to compete head-on with the official Azure DevOps CLI, Azure DevOps MCP, or the GitLab CLI. It is an opinionated workflow layer built around a narrower developer experience.

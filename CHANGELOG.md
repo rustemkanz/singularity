@@ -2,6 +2,26 @@
 
 All notable changes to Singularity are tracked in this file. The project intends to follow [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Repo-local Codex guidance in `AGENTS.md` and `.agents/skills/azure-devops-devloop/`, including target-checkout verification and explicit repository/source selection for pull requests.
+
+### Changed
+
+- `comment`, `start`, `create-pr`, `prepare-review`, and `review` now preview their external action by default and require `--apply` to mutate provider state. Existing PR `--dry-run` usage remains supported.
+- `start` and read-only `start-work` now use the same provider-generated branch and state-transition plan, including `fix/<id>-...` branches for bugs; only `start --apply` changes provider state.
+
+### Security
+
+- Azure DevOps bearer tokens are scoped to exact trusted HTTPS organization URLs when downloading work-item media, are excluded from redirects, and downloads now have timeout and size limits.
+- GitLab tokens are scoped to the exact configured `GITLAB_BASE_URL` HTTPS origin, are excluded from redirects, and are no longer exposed through authenticated curl fallback arguments.
+
+### Fixed
+
+- Authenticated GitLab branch cleanup now uses the scoped urllib transport and correctly handles GitLab's empty successful DELETE response.
+
 ## [0.1.0] - 2026-08-05
 
 Initial public release: a local, approval-aware delivery workflow CLI for agent-assisted development.

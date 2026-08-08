@@ -423,6 +423,36 @@ def cmd_triage(args, token, *, build_work_tracking_provider_func=None):
     print()
 
 
+def _start_work_plan_payload(plan, *, branch_name: str | None = None) -> dict:
+    payload = plan.to_legacy_dict()
+    if not branch_name or branch_name == plan.branch_name:
+        return payload
+
+    payload["branchName"] = branch_name
+    if plan.branch_name:
+        payload["commands"] = [
+            command.replace(plan.branch_name, branch_name)
+            for command in payload["commands"]
+        ]
+    return payload
+
+
+def _print_start_work_plan(plan, *, branch_name: str | None = None) -> None:
+    payload = _start_work_plan_payload(plan, branch_name=branch_name)
+    print(f"\n[{plan.work_item.id}] {plan.work_item.title}")
+    print(f"  Type         : {plan.work_item.kind}")
+    print(f"  Concise title   : {plan.concise_title}")
+    print(f"  Suggested branch : {payload['branchName']}")
+    print(f"  Note path        : {plan.note_path}")
+    print(f"  Commit prefix    : {plan.commit_prefix}")
+    print(f"  PR title         : {plan.change_request_title}")
+    print(f"  PR body          : {plan.change_request_body}")
+    print("\n  Suggested commands:")
+    for command in payload["commands"]:
+        print(f"    {command}")
+    print()
+
+
 def cmd_start_work(args, token, *, build_work_tracking_provider_func=None):
     provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
     plan = provider.get_start_work_plan(item_id=args.id)
@@ -430,32 +460,23 @@ def cmd_start_work(args, token, *, build_work_tracking_provider_func=None):
         print(json.dumps(plan.to_legacy_dict(), indent=2))
         return
 
-    print(f"\n[{plan.work_item.id}] {plan.work_item.title}")
-    print(f"  Type         : {plan.work_item.kind}")
-    print(f"  Concise title   : {plan.concise_title}")
-    print(f"  Suggested branch : {plan.branch_name}")
-    print(f"  Note path        : {plan.note_path}")
-    print(f"  Commit prefix    : {plan.commit_prefix}")
-    print(f"  PR title         : {plan.change_request_title}")
-    print(f"  PR body          : {plan.change_request_body}")
-    print("\n  Suggested commands:")
-    for command in plan.commands:
-        print(f"    {command}")
-    print()
+    _print_start_work_plan(plan)
 
 
 def cmd_start(args, token, *, build_work_tracking_provider_func=None, cmd_show_func=None):
-    show_func = cmd_show_func or cmd_show
-    show_func(args, token)
+    if cmd_show_func is not None:
+        cmd_show_func(args, token)
     provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
+    plan = provider.get_start_work_plan(item_id=args.id)
+    _print_start_work_plan(plan, branch_name=getattr(args, "branch", None))
+
+    if not getattr(args, "apply", False):
+        print("Preview only: no work-item state was changed. Re-run with --apply after approval.\n")
+        return
+
     actual_state = provider.transition_work_item(item_id=args.id, state="In Progress")
     rendered_state = actual_state if isinstance(actual_state, str) and actual_state else "In Progress"
     print(f"✓ Work item {args.id} moved to '{rendered_state}'.")
-    branch = args.branch or f"feature/{args.id}-work-item"
-    print("\nNext - create your branch:\n")
-    print("    git checkout main && git pull")
-    print(f"    git checkout -b {branch}")
-    print(f"    git push -u origin {branch}\n")
 
 
 def cmd_pick_next(
@@ -500,14 +521,22 @@ def cmd_pick_next(
                 provider="azure-devops",
                 repo=None,
                 branch=args.branch,
+                apply=getattr(args, "apply", False),
             ),
             token,
         )
     else:
-        print("Use '--start' to move it to 'In Progress' and print the branch command.\n")
+        if getattr(args, "apply", False):
+            raise CliError("ERROR: --apply requires --start for pick-next.")
+        print("Use '--start' to preview the start plan; add '--apply' after approval to move it to 'In Progress'.\n")
 
 
 def cmd_review(args, token, *, build_work_tracking_provider_func=None):
+    if not getattr(args, "apply", False):
+        print(f"Plan: move work item {args.id} to 'In Review'.")
+        print("Preview only: no work-item state was changed. Re-run with --apply after approval.")
+        return
+
     provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
     actual_state = provider.transition_work_item(item_id=args.id, state="In Review")
     rendered_state = actual_state if isinstance(actual_state, str) and actual_state else "In Review"
@@ -530,6 +559,12 @@ def cmd_handoff_to_qa(args, token, *, cmd_testing_func=None):
 
 
 def cmd_comment(args, token, *, build_work_tracking_provider_func=None):
+    if not getattr(args, "apply", False):
+        print("Plan: add a work-item comment")
+        print(json.dumps({"work_item": args.id, "text": args.text}, indent=2))
+        print("Preview only: no comment was added. Re-run with --apply after approval.")
+        return
+
     provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
     comment_id = provider.add_work_item_comment(item_id=args.id, text=args.text)
     print(f"✓ Comment added to work item {args.id} (comment id: {comment_id}).")
@@ -587,29 +622,34 @@ def register_work_item_subcommands(sub):
     p.add_argument("ids", nargs="+", type=int, metavar="ID")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
-    p = sub.add_parser("pick-next", help="Show or start the next best candidate item")
-    p.add_argument("--start", action="store_true", help="Move the selected item to 'In Progress'")
+    p = sub.add_parser("pick-next", help="Show the next best candidate item and optionally preview its start plan")
+    p.add_argument("--start", action="store_true", help="Preview the selected item's start plan")
+    p.add_argument("--apply", action="store_true",
+                   help="With --start, move the selected item to 'In Progress' after showing the plan")
     p.add_argument("--branch", "-b", metavar="NAME", help="Branch name to use when combined with --start")
 
-    p = sub.add_parser("start", help="Move item to 'In Progress' (prints branch command)")
+    p = sub.add_parser("start", help="Preview the plan to start an item; use --apply to change its state")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
-    p.add_argument("--branch", "-b", metavar="NAME", help="Branch name (default: feature/<id>-work-item)")
+    p.add_argument("--branch", "-b", metavar="NAME", help="Override the provider-suggested branch name")
+    p.add_argument("--apply", action="store_true",
+                   help="Move the item to 'In Progress' after showing its context and start plan")
 
-    p = sub.add_parser("start-work", help="Suggest a branch, note path, commit prefix, and PR draft")
+    p = sub.add_parser("start-work", help="Print the canonical start plan without changing state (supports --json)")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
-    p = sub.add_parser("review", help="Move item to 'In Review'")
+    p = sub.add_parser("review", help="Preview moving an item to 'In Review'; use --apply to change its state")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
+    p.add_argument("--apply", action="store_true", help="Move the item to 'In Review'")
 
     p = sub.add_parser("testing", help="Move item to 'In Testing' and assign to QA")
     p.add_argument("id", type=int)
@@ -625,12 +665,13 @@ def register_work_item_subcommands(sub):
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--qa", metavar="ASSIGNEE", help="QA assignee identity (ADO email or GitLab username)")
 
-    p = sub.add_parser("comment", help="Add a comment to a work item")
+    p = sub.add_parser("comment", help="Preview a work-item comment; use --apply to post it")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("text", help="Comment text")
+    p.add_argument("--apply", action="store_true", help="Post the comment")
 
     p = sub.add_parser("cleanup-artifacts", help="Close disposable tracking/review artifacts and delete disposable branches")
     p.add_argument("--provider", choices=("gitlab",), required=True,

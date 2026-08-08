@@ -20,6 +20,18 @@ class GitLabReviewProviderTests(unittest.TestCase):
         self.assertEqual(parsed["project_path"], "group/subgroup/project")
         self.assertEqual(parsed["merge_request_iid"], 123)
 
+    def test_parse_gitlab_merge_request_url_requires_https(self):
+        with self.assertRaisesRegex(CliError, "must use HTTPS"):
+            parse_gitlab_merge_request_url(
+                "http://gitlab.example.com/group/project/-/merge_requests/123"
+            )
+
+    def test_parse_gitlab_merge_request_url_rejects_userinfo(self):
+        with self.assertRaisesRegex(CliError, "must not contain user information"):
+            parse_gitlab_merge_request_url(
+                "https://gitlab.example.com@evil.example/group/project/-/merge_requests/123"
+            )
+
     def test_resolve_review_context_from_url_builds_gitlab_context(self):
         provider = GitLabReviewProvider("token")
         merge_request = {
@@ -200,13 +212,78 @@ class GitLabReviewProviderTests(unittest.TestCase):
 
         self.assertEqual(headers, {"Accept": "application/json"})
 
-    def test_request_headers_include_private_token_when_configured(self):
+    def test_request_headers_do_not_expose_private_token_as_redirectable_header(self):
         provider = GitLabReviewProvider("token-123")
 
         headers = provider._request_headers(accept="application/json")
 
-        self.assertEqual(headers["Accept"], "application/json")
-        self.assertEqual(headers["PRIVATE-TOKEN"], "token-123")
+        self.assertEqual(headers, {"Accept": "application/json"})
+
+    def test_authenticated_request_accepts_exact_normalized_self_hosted_origin(self):
+        with mock.patch(
+            "providers.gitlab.review_provider.GITLAB_BASE_URL",
+            "https://GitLab.Example.COM:8443/",
+        ):
+            provider = GitLabReviewProvider("token-123")
+
+        with mock.patch.object(provider, "_read_response_body", return_value="{}") as read_body:
+            provider._request_json("https://gitlab.example.com:8443", "/projects/1")
+
+        request = read_body.call_args.args[0]
+        self.assertEqual(request.full_url, "https://gitlab.example.com:8443/api/v4/projects/1")
+        self.assertEqual(request.headers, {"Accept": "application/json"})
+        self.assertEqual(request.unredirected_hdrs["Private-token"], "token-123")
+
+    def test_authenticated_request_rejects_urls_outside_configured_origin_before_network(self):
+        with mock.patch(
+            "providers.gitlab.review_provider.GITLAB_BASE_URL",
+            "https://gitlab.example.com",
+        ):
+            provider = GitLabReviewProvider("token-123")
+
+        hostile_origins = (
+            "https://evil.example",
+            "https://gitlab.example.com.evil.example",
+            "https://gitlab.example.com:8443",
+            "http://gitlab.example.com",
+            "https://gitlab.example.com@evil.example",
+        )
+        with mock.patch("providers.gitlab.review_provider.OPENER") as opener:
+            for origin in hostile_origins:
+                with self.subTest(origin=origin):
+                    with self.assertRaises(CliError):
+                        provider._request_json(origin, "/projects/1")
+
+        opener.open.assert_not_called()
+
+    def test_anonymous_request_allows_another_public_https_gitlab_origin(self):
+        provider = GitLabReviewProvider("")
+
+        with mock.patch.object(provider, "_read_response_body", return_value="{}") as read_body:
+            provider._request_json("https://gitlab.other.example", "/projects/1")
+
+        self.assertEqual(
+            read_body.call_args.args[0].full_url,
+            "https://gitlab.other.example/api/v4/projects/1",
+        )
+
+    def test_authenticated_token_is_not_forwarded_by_redirect_handler(self):
+        provider = GitLabReviewProvider("token-123")
+
+        with mock.patch.object(provider, "_read_response_body", return_value="{}") as read_body:
+            provider._request_json("https://gitlab.com", "/projects/1")
+
+        request = read_body.call_args.args[0]
+        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://attacker.example/redirected",
+        )
+        self.assertNotIn("Private-token", redirected.headers)
+        self.assertNotIn("Private-token", redirected.unredirected_hdrs)
 
     def test_prepare_change_request_builds_gitlab_merge_request_payload(self):
         provider = GitLabReviewProvider("token")
@@ -630,10 +707,51 @@ class GitLabReviewProviderTests(unittest.TestCase):
         with mock.patch("providers.gitlab.review_provider.OPENER") as opener:
             opener.open.side_effect = ssl_error
             with mock.patch("providers.gitlab.review_provider.shutil.which", return_value="/usr/bin/curl"):
-                with mock.patch("providers.gitlab.review_provider.subprocess.run", return_value=curl_result):
+                with mock.patch("providers.gitlab.review_provider.subprocess.run", return_value=curl_result) as run:
                     payload = provider._request_json("https://gitlab.com", "/projects/example%2Fproject/merge_requests/7")
 
         self.assertEqual(payload["iid"], 7)
+        curl_argv = run.call_args.args[0]
+        self.assertFalse(any("PRIVATE-TOKEN" in argument for argument in curl_argv))
+
+    def test_authenticated_request_does_not_fall_back_to_curl_on_ssl_verification_failure(self):
+        provider = GitLabReviewProvider("secret-token")
+        ssl_error = urllib.error.URLError(ssl.SSLCertVerificationError(1, "bad cert"))
+
+        with mock.patch("providers.gitlab.review_provider.OPENER") as opener:
+            opener.open.side_effect = ssl_error
+            with mock.patch("providers.gitlab.review_provider.subprocess.run") as run:
+                with self.assertRaisesRegex(CliError, "curl fallback is disabled"):
+                    provider._request_json(
+                        "https://gitlab.com",
+                        "/projects/example%2Fproject/merge_requests/7",
+                    )
+
+        run.assert_not_called()
+
+    def test_authenticated_curl_fallback_cannot_place_token_in_process_arguments(self):
+        provider = GitLabReviewProvider("secret-token")
+
+        with mock.patch("providers.gitlab.review_provider.subprocess.run") as run:
+            with self.assertRaisesRegex(CliError, "do not use the curl TLS fallback"):
+                provider._request_with_curl(
+                    "https://gitlab.com",
+                    "/projects/1",
+                    accept="application/json",
+                )
+
+        run.assert_not_called()
+
+    def test_request_json_accepts_empty_success_response(self):
+        provider = GitLabReviewProvider(None)
+        with mock.patch.object(provider, "_read_response_body", return_value=""):
+            result = provider._request_json(
+                "https://gitlab.com",
+                "/projects/1/repository/branches/fix%2F123",
+                method="DELETE",
+            )
+
+        self.assertIsNone(result)
 
     def test_request_json_allows_expected_status_codes(self):
         provider = GitLabReviewProvider("")

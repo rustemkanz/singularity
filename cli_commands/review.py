@@ -221,7 +221,19 @@ def cmd_repos(args, token, *, build_review_provider_func=None):
     print()
 
 
+def _require_explicit_change_request_target(args) -> None:
+    if not getattr(args, "apply", False):
+        return
+    missing = [flag for flag, value in (("--repo", args.repo), ("--source", args.source)) if not value]
+    if missing:
+        raise CliError(
+            "ERROR: Applying a pull-request operation requires explicit "
+            f"{' and '.join(missing)} values so the target cannot be inferred from the wrong checkout."
+        )
+
+
 def cmd_create_pr(args, token, *, build_review_provider_func=None):
+    _require_explicit_change_request_target(args)
     provider = _require_provider(build_review_provider_func, "review")(token)
     repository, payload = provider.prepare_change_request(
         work_item_id=args.id,
@@ -233,12 +245,15 @@ def cmd_create_pr(args, token, *, build_review_provider_func=None):
         work_item_title=args.work_item_title,
     )
 
-    if args.dry_run:
-        print("Dry run: create PR payload")
+    if getattr(args, "dry_run", False) or not getattr(args, "apply", False):
+        label = "Dry run" if getattr(args, "dry_run", False) else "Plan"
+        print(f"{label}: create PR payload")
         print(json.dumps({
             "repository": {"id": repository.id, "name": repository.name},
             "payload": payload,
         }, indent=2))
+        if not getattr(args, "dry_run", False):
+            print("Preview only: no pull request was created. Re-run with --apply after approval.")
         return
 
     change_request = provider.create_change_request(
@@ -264,6 +279,7 @@ def cmd_prepare_review(
     build_review_provider_func=None,
     build_work_tracking_provider_func=None,
 ):
+    _require_explicit_change_request_target(args)
     review_provider = _require_provider(build_review_provider_func, "review")(token)
     repository, payload = review_provider.prepare_change_request(
         work_item_id=args.id,
@@ -275,8 +291,9 @@ def cmd_prepare_review(
         work_item_title=args.work_item_title,
     )
 
-    if args.dry_run:
-        print("Dry run: prepare-review payload")
+    if getattr(args, "dry_run", False) or not getattr(args, "apply", False):
+        label = "Dry run" if getattr(args, "dry_run", False) else "Plan"
+        print(f"{label}: prepare-review payload")
         print(json.dumps({
             "repository": {"id": repository.id, "name": repository.name},
             "pull_request": payload,
@@ -285,6 +302,8 @@ def cmd_prepare_review(
                 "state": "In Review",
             },
         }, indent=2))
+        if not getattr(args, "dry_run", False):
+            print("Preview only: no pull request was created and no work-item state was changed. Re-run with --apply after approval.")
         return
 
     change_request = review_provider.create_change_request(
@@ -876,33 +895,39 @@ def register_review_subcommands(sub):
     p = sub.add_parser("repos", help="List git repositories in the project")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
-    p = sub.add_parser("create-pr", help="Create a pull request or merge request for a tracking item")
+    p = sub.add_parser("create-pr", help="Preview a pull/merge request; use --apply to create it")
     p.add_argument("id", type=int)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Review provider to use for change-request creation (default: azure-devops)")
-    p.add_argument("--repo", metavar="REPO", help="Repository name or id")
-    p.add_argument("--source", metavar="BRANCH", help="Source branch name (default: current git branch)")
+    p.add_argument("--repo", metavar="REPO", help="Repository name or id (required with --apply)")
+    p.add_argument("--source", metavar="BRANCH", help="Source branch name (required with --apply; preview defaults to current git branch)")
     p.add_argument("--target", metavar="BRANCH", default="main",
                    help="Target branch name (default: main)")
     p.add_argument("--title", metavar="TEXT", help="PR title (default: derived from work item)")
     p.add_argument("--description", metavar="TEXT", help="PR description (default: Closes #<id>)")
     p.add_argument("--work-item-title", metavar="TEXT",
                    help="Optional pre-fetched tracking-item title to avoid an extra API call")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the payload instead of creating the PR")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true",
+                      help="Create the pull request or merge request after reviewing the payload")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="Explicitly print the payload without creating the PR (the default; retained for compatibility)")
 
-    p = sub.add_parser("prepare-review", help="Create a pull request and move the work item to In Review")
+    p = sub.add_parser("prepare-review", help="Preview PR creation and review handoff; use --apply to perform both")
     p.add_argument("id", type=int)
-    p.add_argument("--repo", metavar="REPO", help="Repository name or id")
-    p.add_argument("--source", metavar="BRANCH", help="Source branch name (default: current git branch)")
+    p.add_argument("--repo", metavar="REPO", help="Repository name or id (required with --apply)")
+    p.add_argument("--source", metavar="BRANCH", help="Source branch name (required with --apply; preview defaults to current git branch)")
     p.add_argument("--target", metavar="BRANCH", default="main",
                    help="Target branch name (default: main)")
     p.add_argument("--title", metavar="TEXT", help="PR title (default: derived from work item)")
     p.add_argument("--description", metavar="TEXT", help="PR description (default: Closes #<id>)")
     p.add_argument("--work-item-title", metavar="TEXT",
                    help="Optional pre-fetched work item title to avoid an extra API call")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print the PR and state-transition payload instead of applying changes")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true",
+                      help="Create the PR and move the work item to 'In Review' after reviewing the payload")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="Explicitly print the PR and transition payload (the default; retained for compatibility)")
 
     p = sub.add_parser("pr-analyze", help="Summarize a PR from a URL or repo/PR reference")
     p.add_argument("--url", metavar="PR_URL",

@@ -1,9 +1,39 @@
 import os
 import tempfile
 import unittest
+import urllib.request
 from unittest import mock
 
 from providers.azure_devops import work_item_context as provider_work_item_context
+
+
+class FakeDownloadResponse:
+    def __init__(self, payload=b"png-bytes", headers=None):
+        self.payload = payload
+        self.headers = headers or {"Content-Type": "image/png"}
+        self.read_size = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, size=-1):
+        self.read_size = size
+        return self.payload
+
+
+class CapturingDownloadOpener:
+    def __init__(self, response=None):
+        self.request = None
+        self.timeout = None
+        self.response = response or FakeDownloadResponse()
+
+    def open(self, request, *, timeout):
+        self.request = request
+        self.timeout = timeout
+        return self.response
 
 
 class WorkItemContextTests(unittest.TestCase):
@@ -138,38 +168,20 @@ class WorkItemContextTests(unittest.TestCase):
         self.assertEqual(summary["remaining"], 1)
 
     def test_download_reference_uses_shared_configured_opener(self):
-        class FakeResponse:
-            def __init__(self):
-                self.headers = {"Content-Type": "image/png"}
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return b"png-bytes"
-
-        class FakeOpener:
-            def __init__(self):
-                self.request = None
-
-            def open(self, request):
-                self.request = request
-                return FakeResponse()
-
         reference = provider_work_item_context.build_reference(
             "field",
             "Description",
-            "https://example.test/rendered-image",
+            "https://dev.azure.com/example-org/example-project/_apis/wit/attachments/123",
             name="rendered-image",
             is_image=True,
         )
-        opener = FakeOpener()
+        opener = CapturingDownloadOpener()
 
         with tempfile.TemporaryDirectory() as download_dir:
-            with mock.patch.object(provider_work_item_context, "OPENER", opener):
+            with (
+                mock.patch.object(provider_work_item_context, "OPENER", opener),
+                mock.patch.object(provider_work_item_context, "ORG", "example-org"),
+            ):
                 target_path, reused = provider_work_item_context.download_reference(
                     "token-123",
                     reference,
@@ -182,6 +194,114 @@ class WorkItemContextTests(unittest.TestCase):
             self.assertTrue(target_path.endswith(".png"))
             self.assertTrue(os.path.exists(target_path))
             self.assertEqual(opener.request.get_header("Authorization"), "Bearer token-123")
+            self.assertNotIn("Authorization", opener.request.headers)
+            self.assertEqual(
+                opener.request.unredirected_hdrs["Authorization"],
+                "Bearer token-123",
+            )
+            self.assertEqual(opener.timeout, provider_work_item_context.DOWNLOAD_TIMEOUT_SECONDS)
+            self.assertEqual(
+                opener.response.read_size,
+                provider_work_item_context.MAX_DOWNLOAD_BYTES + 1,
+            )
+
+    def test_download_reference_never_authenticates_untrusted_urls(self):
+        urls = (
+            "https://external.example/image.png",
+            "https://dev.azure.com.evil.example/example-org/image.png",
+            "https://dev.azure.com/another-org/image.png",
+            "http://dev.azure.com/example-org/image.png",
+            "https://user@dev.azure.com/example-org/image.png",
+            "https://dev.azure.com:8443/example-org/image.png",
+        )
+
+        with tempfile.TemporaryDirectory() as download_dir:
+            for index, url in enumerate(urls, start=1):
+                with self.subTest(url=url):
+                    opener = CapturingDownloadOpener()
+                    reference = provider_work_item_context.build_reference(
+                        "field",
+                        "Description",
+                        url,
+                        name=f"image-{index}.png",
+                        is_image=True,
+                    )
+                    with (
+                        mock.patch.object(provider_work_item_context, "OPENER", opener),
+                        mock.patch.object(provider_work_item_context, "ORG", "example-org"),
+                    ):
+                        provider_work_item_context.download_reference(
+                            "token-123",
+                            reference,
+                            download_dir,
+                            index,
+                            {},
+                        )
+
+                    self.assertIsNone(opener.request.get_header("Authorization"))
+                    self.assertNotIn("Authorization", opener.request.unredirected_hdrs)
+
+    def test_azure_devops_auth_scope_accepts_exact_modern_and_legacy_urls(self):
+        trusted_urls = (
+            "https://dev.azure.com/example-org/project/_apis/wit/attachments/123",
+            "https://dev.azure.com:443/EXAMPLE-ORG/project/file.png",
+            "https://dev.azure.com/example%2Dorg/project/file.png",
+            "https://example-org.visualstudio.com/project/_apis/wit/attachments/123",
+        )
+
+        for url in trusted_urls:
+            with self.subTest(url=url):
+                self.assertTrue(
+                    provider_work_item_context.is_trusted_azure_devops_url(
+                        url,
+                        "example-org",
+                    )
+                )
+
+    def test_redirect_does_not_copy_azure_devops_authorization(self):
+        reference = provider_work_item_context.build_reference(
+            "field",
+            "Description",
+            "https://dev.azure.com/example-org/project/_apis/wit/attachments/123",
+            name="image.png",
+            is_image=True,
+        )
+        opener = CapturingDownloadOpener()
+
+        with tempfile.TemporaryDirectory() as download_dir:
+            with (
+                mock.patch.object(provider_work_item_context, "OPENER", opener),
+                mock.patch.object(provider_work_item_context, "ORG", "example-org"),
+            ):
+                provider_work_item_context.download_reference(
+                    "token-123",
+                    reference,
+                    download_dir,
+                    1,
+                    {},
+                )
+
+        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+            opener.request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://external.example/image.png",
+        )
+
+        self.assertEqual(opener.request.get_header("Authorization"), "Bearer token-123")
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_download_rejects_payload_larger_than_limit(self):
+        response = FakeDownloadResponse(
+            payload=b"12345",
+            headers={"Content-Type": "image/png"},
+        )
+
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            provider_work_item_context.read_bounded_download(response, max_bytes=4)
 
 
 if __name__ == "__main__":
