@@ -341,6 +341,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - Add resumable journals or idempotency keys for sequential bulk cleanup operations.
 - Extract a reusable core service layer from the monolithic script.
 - Deepen the GitLab adapter toward parity with the Azure DevOps workflow surface, including build visibility.
+- Defer GitHub integration until after the current roadmap; when revisited, prefer a thin approval-aware provider for PR, review, and Actions workflows rather than duplicating the official GitHub MCP server or `gh` CLI.
 - Add an MCP wrapper only after the service boundaries are stable.
 
 ## Positioning
