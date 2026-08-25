@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -325,6 +326,24 @@ class MutationPlanTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SG_MUTATION_PLAN_STORE": link}):
             with self.assertRaisesRegex(PlanApprovalError, "safe directory"):
                 render_human_preview(self.make_plan())
+
+    def test_plan_store_reachable_only_through_ancestor_symlink_is_allowed(self):
+        # Regression test: on stock macOS, tempfile.gettempdir() resolves under
+        # /var, and /var is itself a symlink to /private/var. The store
+        # directory's own final component is never a symlink, only one of its
+        # ancestors is, so this must be accepted rather than rejected.
+        real_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, real_root, ignore_errors=True)
+        link_root = real_root + "-link"
+        try:
+            os.symlink(real_root, link_root, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"Symbolic links unavailable: {exc}")
+        self.addCleanup(lambda: os.path.islink(link_root) and os.unlink(link_root))
+
+        store_root = os.path.join(link_root, "store")
+        with mock.patch.dict(os.environ, {"SG_MUTATION_PLAN_STORE": store_root}):
+            render_human_preview(self.make_plan())
 
     def test_plan_errors_are_cli_errors(self):
         with self.assertRaises(CliError):

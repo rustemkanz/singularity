@@ -610,6 +610,47 @@ class LinkedChangeRequest:
 
 
 @dataclass(frozen=True)
+class ServiceEndpointSummary:
+    id: str
+    name: str
+    type: str
+    url: str | None
+    is_ready: bool
+    is_shared: bool
+    owner: str | None
+    description: str | None
+    created_by: str | None
+    authorization_scheme: str | None
+    service_principal_id: str | None
+    tenant_id: str | None
+    subscription_id: str | None
+    subscription_name: str | None
+
+    def to_legacy_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type,
+            "url": self.url,
+            "isReady": self.is_ready,
+            "isShared": self.is_shared,
+            "owner": self.owner,
+            "description": self.description,
+            "createdBy": self.created_by,
+            "authorizationScheme": self.authorization_scheme,
+            "servicePrincipalId": self.service_principal_id,
+            "tenantId": self.tenant_id,
+            "subscriptionId": self.subscription_id,
+            "subscriptionName": self.subscription_name,
+        }
+
+    def to_display_line(self) -> str:
+        ready_text = "ready" if self.is_ready else "not-ready"
+        spn_text = f" spn={self.service_principal_id}" if self.service_principal_id else ""
+        return f"{self.id}  {self.name:<40}  {self.type:<16}  {ready_text}{spn_text}"
+
+
+@dataclass(frozen=True)
 class LinkedCommit:
     repo_name: str
     repo_id: str | None

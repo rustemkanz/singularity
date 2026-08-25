@@ -16,6 +16,7 @@ from workflow_models import (
     ReviewChangeSummary,
     ReviewFileChange,
     ReviewThread,
+    ServiceEndpointSummary,
     Sprint,
     StartWorkPlan,
     TriageReport,
@@ -353,6 +354,26 @@ class BuildProvider(Protocol):
         approval_id: str,
         comment: str,
     ) -> bool:
+        ...
+
+
+class ServiceEndpointProvider(Protocol):
+    def list_service_endpoints(
+        self,
+        *,
+        project: str,
+        endpoint_names: list[str] | None = None,
+        endpoint_type: str | None = None,
+    ) -> list[ServiceEndpointSummary]:
+        ...
+
+    def get_service_endpoint(
+        self,
+        *,
+        project: str,
+        name: str | None = None,
+        endpoint_id: str | None = None,
+    ) -> ServiceEndpointSummary:
         ...
 
 

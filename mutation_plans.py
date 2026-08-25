@@ -253,11 +253,7 @@ def _plan_store_directory(checkout: str) -> str:
 
 def _validate_private_store_directory(path: str) -> None:
     absolute_path = os.path.abspath(path)
-    if (
-        not os.path.isdir(absolute_path)
-        or os.path.islink(absolute_path)
-        or os.path.normcase(os.path.realpath(absolute_path)) != os.path.normcase(absolute_path)
-    ):
+    if not os.path.isdir(absolute_path) or os.path.islink(absolute_path):
         raise PlanApprovalError("ERROR: Mutation plan store is not a safe directory.")
     if os.name != "nt":
         metadata = os.stat(absolute_path, follow_symlinks=False)

@@ -340,13 +340,9 @@ def download_directory_anchor(absolute_dir: str) -> tuple[str, list[str], bool]:
 
 
 def validate_existing_download_directory(directory: str) -> str:
-    """Reject an existing directory reached through a symlink or junction."""
+    """Reject an existing directory that is itself a symlink or junction."""
     absolute_dir = os.path.abspath(directory)
-    if (
-        not os.path.isdir(absolute_dir)
-        or os.path.normcase(os.path.realpath(absolute_dir))
-        != os.path.normcase(absolute_dir)
-    ):
+    if not os.path.isdir(absolute_dir) or os.path.islink(absolute_dir):
         raise ValueError("Download directory must not contain symlinks or junctions.")
     return absolute_dir
 
@@ -461,7 +457,7 @@ def write_unique_download(
                 flags |= os.O_NOFOLLOW
             try:
                 if directory_fd is None:
-                    if os.path.normcase(os.path.realpath(safe_dir)) != os.path.normcase(safe_dir):
+                    if os.path.islink(safe_dir):
                         raise ValueError("Download directory changed before artifact creation.")
                     file_fd = os.open(candidate_path, flags, 0o600)
                 else:

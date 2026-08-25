@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "singularity-sg"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local, approval-aware delivery workflow CLI for human-guided, agent-assisted delivery across Azure DevOps and GitLab."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,4 +1,5 @@
 import os
+import shutil
 import socket
 import tempfile
 import unittest
@@ -737,28 +738,43 @@ class WorkItemContextTests(unittest.TestCase):
 
     def test_download_directory_validates_existing_anchor_before_mkdir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            anchor_dir = os.path.join(temp_dir, "anchor")
-            os.makedirs(anchor_dir)
-            requested_dir = os.path.join(anchor_dir, "new-child")
-            original_realpath = os.path.realpath
+            actual_dir = os.path.join(temp_dir, "actual")
+            symlink_dir = os.path.join(temp_dir, "linked")
+            os.makedirs(actual_dir)
+            try:
+                os.symlink(actual_dir, symlink_dir, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"Directory symlinks are unavailable: {exc}")
+            requested_dir = os.path.join(symlink_dir, "new-child")
 
-            def redirected_realpath(path):
-                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(anchor_dir):
-                    return os.path.join(temp_dir, "outside")
-                return original_realpath(path)
-
-            with (
-                mock.patch.object(
-                    provider_work_item_context.os.path,
-                    "realpath",
-                    side_effect=redirected_realpath,
-                ),
-                mock.patch.object(provider_work_item_context.os, "mkdir") as mkdir,
-            ):
+            with mock.patch.object(provider_work_item_context.os, "mkdir") as mkdir:
                 with self.assertRaisesRegex(ValueError, "symlinks or junctions"):
                     provider_work_item_context.prepare_download_directory(requested_dir)
 
             mkdir.assert_not_called()
+
+    def test_download_directory_reachable_only_through_ancestor_symlink_is_allowed(self):
+        # Regression test: on stock macOS, tempfile.gettempdir() resolves under
+        # /var, and /var is itself a symlink to /private/var. The anchor
+        # directory's own final component is never a symlink, only one of its
+        # ancestors is, so this must be accepted rather than rejected.
+        real_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, real_root, ignore_errors=True)
+        link_root = real_root + "-link"
+        try:
+            os.symlink(real_root, link_root, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"Symbolic links unavailable: {exc}")
+        self.addCleanup(lambda: os.path.islink(link_root) and os.unlink(link_root))
+        anchor_dir = os.path.join(real_root, "T")
+        os.makedirs(anchor_dir)
+
+        target_path = provider_work_item_context.write_unique_download(
+            os.path.join(link_root, "T", "downloads"),
+            "image.png",
+            b"payload",
+        )
+        self.assertTrue(os.path.isfile(target_path))
 
     def test_artifact_creation_is_exclusive_and_containment_checked(self):
         with tempfile.TemporaryDirectory() as download_dir:

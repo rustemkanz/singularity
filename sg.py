@@ -43,6 +43,8 @@ Commands:
     approve-gate    Preview approval of one pipeline gate
     build-logs      Show build logs for matching stages, jobs, or steps
     queue-build     Preview queueing a new pipeline run
+    service-endpoints List Azure DevOps service connections/endpoints
+    service-endpoint-show Show one Azure DevOps service connection/endpoint
     doctor          Check Azure CLI auth, project access, and repo resolution
 """
 
@@ -54,6 +56,7 @@ import urllib.parse
 from cli_commands import builds as build_commands
 from cli_commands import doctor as doctor_commands
 from cli_commands import review as review_commands
+from cli_commands import service_endpoints as service_endpoint_commands
 from cli_commands import work_items as work_item_commands
 from app_config import (
     DEFAULT_REPO,
@@ -72,6 +75,7 @@ from providers.azure_devops import (
     AzureDevOpsBuildProvider,
     AzureDevOpsEvidenceProvider,
     AzureDevOpsReviewProvider,
+    AzureDevOpsServiceEndpointProvider,
     AzureDevOpsWorkTrackingProvider,
 )
 from providers.gitlab import GitLabReviewProvider, is_gitlab_merge_request_url
@@ -103,6 +107,10 @@ def build_work_tracking_provider_for_args(token: str, args):
 
 def build_evidence_provider(token: str) -> AzureDevOpsEvidenceProvider:
     return AzureDevOpsEvidenceProvider(token)
+
+
+def build_service_endpoint_provider(token: str) -> AzureDevOpsServiceEndpointProvider:
+    return AzureDevOpsServiceEndpointProvider(token)
 
 
 def truncate_text(text: str, limit: int = 1000) -> str:
@@ -543,6 +551,22 @@ def cmd_build_status(args, token):
 
 
 
+def cmd_service_endpoints(args, token):
+    return service_endpoint_commands.cmd_service_endpoints(
+        args,
+        token,
+        build_service_endpoint_provider_func=build_service_endpoint_provider,
+    )
+
+
+def cmd_service_endpoint_show(args, token):
+    return service_endpoint_commands.cmd_service_endpoint_show(
+        args,
+        token,
+        build_service_endpoint_provider_func=build_service_endpoint_provider,
+    )
+
+
 def cmd_pr_statuses(args, token):
     return review_commands.cmd_pr_statuses(
         args,
@@ -584,6 +608,8 @@ COMMAND_REQUIRED_CONFIG: dict[str, tuple[str, ...]] = {
     "approve-gate": ("AZURE_DEVOPS_ORG",),
     "build-logs": ("AZURE_DEVOPS_ORG",),
     "queue-build": ("AZURE_DEVOPS_ORG",),
+    "service-endpoints": ("AZURE_DEVOPS_ORG",),
+    "service-endpoint-show": ("AZURE_DEVOPS_ORG",),
     "teams": BASE_COMMAND_REQUIRED_CONFIG,
     "sprint": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID",),
     "list": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID", "AZURE_DEVOPS_USER"),
@@ -692,6 +718,7 @@ def main():
     work_item_commands.register_work_item_subcommands(sub)
     review_commands.register_review_subcommands(sub)
     build_commands.register_build_subcommands(sub)
+    service_endpoint_commands.register_service_endpoint_subcommands(sub)
     doctor_commands.register_doctor_subcommands(sub)
 
     args = parser.parse_args()
@@ -735,6 +762,8 @@ def main():
         "approve-gate": cmd_approve_gate,
         "build-logs":   cmd_build_logs,
         "queue-build":  cmd_queue_build,
+        "service-endpoints": cmd_service_endpoints,
+        "service-endpoint-show": cmd_service_endpoint_show,
         "doctor":       cmd_doctor,
     }
     try:

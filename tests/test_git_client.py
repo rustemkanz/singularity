@@ -45,6 +45,17 @@ class ResolveGitCommitTests(unittest.TestCase):
             with self.assertRaisesRegex(CliError, "one full 40-character commit SHA"):
                 git_client.resolve_git_commit("main")
 
+    def test_hints_at_wrong_working_directory_when_not_in_a_git_repo(self):
+        with mock.patch.object(
+            git_client,
+            "git_output",
+            side_effect=CliError(
+                "fatal: not a git repository (or any of the parent directories): .git"
+            ),
+        ):
+            with self.assertRaisesRegex(CliError, "outside a Git working directory"):
+                git_client.resolve_git_commit("main")
+
     def test_rejects_an_empty_ref_without_running_git(self):
         with mock.patch.object(git_client, "git_output") as git_output:
             with self.assertRaisesRegex(CliError, "must not be empty"):

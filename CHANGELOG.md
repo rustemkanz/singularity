@@ -4,12 +4,15 @@ All notable changes to Singularity are tracked in this file. The project intends
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-25
+
 ### Added
 
 - Repo-local Codex guidance in `AGENTS.md` and `.agents/skills/azure-devops-devloop/`, including target-checkout verification and explicit repository/source selection for pull requests.
 - Immutable, provider-neutral mutation plans with full nonce-backed SHA-256 Plan IDs and local one-shot approval records.
 - Read-only `build-approvals` and approval-gated `approve-gate` commands for pipeline gates.
 - `AZURE_DEVOPS_EXTERNAL_MEDIA_ORIGINS` for explicit exact-origin media trust decisions.
+- Read-only `service-endpoints` and `service-endpoint-show` commands for Azure DevOps service connection/endpoint introspection (id, type, readiness, owner, and the app/service-principal and tenant IDs used for CI-auth debugging).
 
 ### Changed
 
@@ -33,6 +36,8 @@ All notable changes to Singularity are tracked in this file. The project intends
 ### Fixed
 
 - Authenticated GitLab branch cleanup now uses the scoped urllib transport and correctly handles GitLab's empty successful DELETE response.
+- Mutation-plan store validation and work-item attachment download-directory validation (including the non-`dir_fd` fallback path) no longer reject a directory solely because a benign ancestor path component is a symlink (e.g. macOS's `/var` → `/private/var`); every mutation-gated command and `attachments` downloads failed unconditionally on stock macOS. Each check still rejects the directory itself being a symlink.
+- `queue-build` (and other commands that resolve a Git ref) now hints that the failure likely means `sg` was run outside a Git working directory, instead of surfacing only git's raw `fatal:` message.
 
 ## [0.1.0] - 2026-08-05
 

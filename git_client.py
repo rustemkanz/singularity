@@ -56,6 +56,12 @@ def resolve_git_commit(ref: str) -> str:
             reject_stderr=True,
         )
     except CliError as exc:
+        if "not a git repository" in str(exc):
+            raise CliError(
+                f"ERROR: Could not resolve Git commit reference '{normalized_ref}': {exc}\n"
+                "This usually means sg was run outside a Git working directory. "
+                "cd into the target repo (or a subdirectory of it) and retry."
+            ) from exc
         raise CliError(
             f"ERROR: Could not resolve Git commit reference '{normalized_ref}': {exc}"
         ) from exc

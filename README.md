@@ -206,6 +206,14 @@ sg queue-build --definition <definition-id> --project <project> --branch <branch
 
 `queue-build` resolves `--commit` (or the selected branch/`HEAD` by default) to a full SHA before previewing. That exact `sourceVersion` and the recent matching-build snapshot are part of the Plan ID, so a moved ref or changed duplicate snapshot requires a fresh preview and approval; the Azure DevOps queue request receives the pinned `sourceVersion`. Existing matching runs block queueing by default, and `--allow-duplicate` must itself be present in both the preview and approved apply.
 
+Service connections (service endpoints) are read-only:
+
+```bash
+sg service-endpoints --project <project>
+sg service-endpoint-show <endpoint-name> --project <project>
+sg service-endpoint-show --id <endpoint-id> --project <project>
+```
+
 GitLab preview uses the same review commands with a GitLab merge-request URL:
 
 ```bash
