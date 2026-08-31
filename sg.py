@@ -48,6 +48,8 @@ Commands:
     queue-build     Preview queueing a new pipeline run
     service-endpoints List Azure DevOps service connections/endpoints
     service-endpoint-show Show one Azure DevOps service connection/endpoint
+    profiles        List project profiles and show the active one
+    use             Set or clear the active project profile
     doctor          Check Azure CLI auth, project access, and repo resolution
 """
 
@@ -58,6 +60,7 @@ import sys
 import urllib.parse
 from cli_commands import builds as build_commands
 from cli_commands import doctor as doctor_commands
+from cli_commands import profiles as profile_commands
 from cli_commands import review as review_commands
 from cli_commands import service_endpoints as service_endpoint_commands
 from cli_commands import work_items as work_item_commands
@@ -604,6 +607,14 @@ def cmd_pr_statuses(args, token):
     )
 
 
+def cmd_profiles(args, _token=None):
+    return profile_commands.cmd_profiles(args, _token)
+
+
+def cmd_use(args, _token=None):
+    return profile_commands.cmd_use(args, _token)
+
+
 def cmd_doctor(args, _token=None):
     return doctor_commands.cmd_doctor(
         args,
@@ -631,6 +642,8 @@ def cmd_doctor(args, _token=None):
 BASE_COMMAND_REQUIRED_CONFIG = ("AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PROJECT")
 COMMAND_REQUIRED_CONFIG: dict[str, tuple[str, ...]] = {
     "doctor": (),
+    "profiles": (),
+    "use": (),
     "builds": ("AZURE_DEVOPS_ORG",),
     "build-status": ("AZURE_DEVOPS_ORG",),
     "build-approvals": ("AZURE_DEVOPS_ORG",),
@@ -704,7 +717,7 @@ def uses_gitlab_work_tracking_provider(command: str, args) -> bool:
 
 
 def resolve_command_token(args):
-    if args.command == "doctor":
+    if args.command in {"doctor", "profiles", "use"}:
         return None
     if uses_gitlab_review_provider(args.command, args) or uses_gitlab_work_tracking_provider(args.command, args):
         return GITLAB_TOKEN or ""
@@ -753,6 +766,7 @@ def main():
     review_commands.register_review_subcommands(sub)
     build_commands.register_build_subcommands(sub)
     service_endpoint_commands.register_service_endpoint_subcommands(sub)
+    profile_commands.register_profile_subcommands(sub)
     doctor_commands.register_doctor_subcommands(sub)
 
     args = parser.parse_args()
@@ -801,6 +815,8 @@ def main():
         "queue-build":  cmd_queue_build,
         "service-endpoints": cmd_service_endpoints,
         "service-endpoint-show": cmd_service_endpoint_show,
+        "profiles":     cmd_profiles,
+        "use":          cmd_use,
         "doctor":       cmd_doctor,
     }
     try:

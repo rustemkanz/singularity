@@ -3,10 +3,31 @@ import contextlib
 import io
 import json
 import unittest
+from unittest import mock
 
 from cli_commands import doctor as doctor_commands
 from cli_commands import review as review_commands
 from errors import CliError
+
+
+def _run_doctor_json(**overrides):
+    args = argparse.Namespace(json=True)
+    kwargs = dict(
+        probe_azure_token_func=lambda: {"ok": True, "token": "token", "hints": []},
+        infer_git_repository_ref_func=lambda: "sample-repo",
+        current_git_branch_func=lambda: "main",
+        missing_required_config_func=lambda: [],
+        org="example-org",
+        project="Example Project",
+        team_id="team-1",
+        me="me@example.com",
+        default_repo=None,
+        cli_error_cls=CliError,
+    )
+    kwargs.update(overrides)
+    with contextlib.redirect_stdout(io.StringIO()) as stdout:
+        doctor_commands.cmd_doctor(args, **kwargs)
+    return json.loads(stdout.getvalue())
 
 
 class DoctorCommandTests(unittest.TestCase):
@@ -65,7 +86,7 @@ class DoctorCommandTests(unittest.TestCase):
         git_check = next(check for check in rendered["checks"] if check["name"] == "gitRemoteRepo")
         repo_check = next(check for check in rendered["checks"] if check["name"] == "azureDevopsRepoResolution")
         self.assertTrue(git_check["ok"])
-        self.assertIn("Could not infer an Azure DevOps repository", git_check["detail"])
+        self.assertIn("No Azure DevOps repository is linked", git_check["detail"])
         self.assertIn("AZURE_DEVOPS_DEFAULT_REPO='sample-repo'", git_check["hints"][0])
         self.assertTrue(repo_check["ok"])
         self.assertIn("from AZURE_DEVOPS_DEFAULT_REPO", repo_check["detail"])
@@ -95,6 +116,23 @@ class DoctorCommandTests(unittest.TestCase):
 
         rendered = json.loads(stdout.getvalue())
         self.assertIsNone(next((check for check in rendered["checks"] if check["name"] == "azureDevopsRepoResolution"), None))
+
+
+    def test_cmd_doctor_reports_the_active_profile(self):
+        with (
+            mock.patch.object(doctor_commands, "ACTIVE_PROFILE", "web-eu"),
+            mock.patch.object(doctor_commands, "ACTIVE_PROFILE_SOURCE", "file"),
+        ):
+            rendered = _run_doctor_json()
+        self.assertEqual(rendered["activeProfile"], "web-eu")
+        profile_check = next(check for check in rendered["checks"] if check["name"] == "profile")
+        self.assertIn("web-eu", profile_check["detail"])
+
+    def test_cmd_doctor_git_repo_line_is_not_a_contradiction_when_unlinked(self):
+        rendered = _run_doctor_json(infer_git_repository_ref_func=lambda: None)
+        git_check = next(check for check in rendered["checks"] if check["name"] == "gitRemoteRepo")
+        self.assertTrue(git_check["ok"])
+        self.assertNotIn("Could not infer", git_check["detail"])
 
 
 if __name__ == "__main__":

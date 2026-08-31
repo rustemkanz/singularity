@@ -118,6 +118,23 @@ class SgEntrypointTests(unittest.TestCase):
         self.assertEqual(exit_context.exception.code, 2)
         self.assertIn("--repo", stderr.getvalue())
 
+    def test_profiles_and_use_need_no_azure_config_and_no_token(self):
+        for command, extra in (("profiles", []), ("use", ["--clear"])):
+            with self.subTest(command=command):
+                self.assertEqual(sg.COMMAND_REQUIRED_CONFIG[command], ())
+                captured = {}
+
+                def fake(args, token=None):
+                    captured["token"] = token
+
+                with (
+                    mock.patch.object(sg, f"cmd_{command.replace('-', '_')}", side_effect=fake),
+                    mock.patch.object(sg, "get_token", side_effect=AssertionError("no token expected")),
+                    mock.patch.object(sys, "argv", ["sg", command, *extra]),
+                ):
+                    sg.main()
+                self.assertIsNone(captured["token"])
+
     def test_work_item_commands_accept_a_work_item_url_in_place_of_an_id(self):
         captured = {}
 

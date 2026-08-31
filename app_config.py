@@ -3,9 +3,12 @@ import ipaddress
 import os
 import re
 import ssl
+import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+from profiles import profile_env_file, resolve_active_profile
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -69,6 +72,29 @@ def load_local_env_defaults(
     return loaded_files
 
 
+def apply_active_profile_env() -> tuple[str | None, str | None]:
+    """Layer the active profile's ``<name>.env`` under real environment variables."""
+    name, source = resolve_active_profile()
+    if not name:
+        return None, None
+    env_file = profile_env_file(name)
+    if not env_file.is_file():
+        print(
+            f"WARNING: Active Singularity profile '{name}' has no env file at {env_file}.",
+            file=sys.stderr,
+        )
+        return name, source
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        parsed = parse_env_assignment(raw_line)
+        if not parsed:
+            continue
+        key, value = parsed
+        if key not in os.environ:
+            os.environ[key] = value
+    return name, source
+
+
+ACTIVE_PROFILE, ACTIVE_PROFILE_SOURCE = apply_active_profile_env()
 load_local_env_defaults()
 
 
