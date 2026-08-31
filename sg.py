@@ -14,6 +14,7 @@ Commands:
     show <id>       Show full details of a work item
     comments <id>   Show work-item comments
     context <id>    Show full work-item context including comments and linked dev artifacts
+    tree <id>       Show a work item's parent chain and child items with assignee/tags
     attachments <id> Show or download attachment and screenshot context
     introduced-by <id> Show linked PR/commit candidates that likely introduced a bug
     triage <ids...> Summarize several work items and suggest grouping for PRs
@@ -165,6 +166,14 @@ def cmd_context(args, token):
         args,
         token,
         build_work_tracking_provider_func=lambda token_value: build_work_tracking_provider_for_args(token_value, args),
+    )
+
+
+def cmd_tree(args, token):
+    return work_item_commands.cmd_tree(
+        args,
+        token,
+        build_work_tracking_provider_func=build_work_tracking_provider,
     )
 
 
@@ -744,6 +753,7 @@ def main():
         "show":        cmd_show,
         "comments":    cmd_comments,
         "context":     cmd_context,
+        "tree":        cmd_tree,
         "attachments": cmd_attachments,
         "introduced-by": cmd_introduced_by,
         "triage":      cmd_triage,

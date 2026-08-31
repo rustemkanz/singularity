@@ -565,6 +565,9 @@ class RelatedWorkItem:
     title: str
     kind: str
     state: str
+    assignee: str = ""
+    tags: tuple[str, ...] = ()
+    iteration: str = ""
 
     def to_legacy_dict(self) -> dict:
         return {
@@ -572,6 +575,9 @@ class RelatedWorkItem:
             "title": self.title,
             "workItemType": self.kind,
             "state": self.state,
+            "assignedTo": self.assignee,
+            "tags": list(self.tags),
+            "iterationPath": self.iteration,
         }
 
 

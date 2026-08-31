@@ -2,7 +2,11 @@ import urllib.parse
 import copy
 
 from errors import CliError
-from providers.azure_devops.work_item_context import build_work_item_comments, build_work_item_context
+from providers.azure_devops.work_item_context import (
+    build_work_item_comments,
+    build_work_item_context,
+    build_work_item_tree,
+)
 from app_config import API_VER, BASE_URL, ORG, PROJECT
 from providers.azure_devops.http import api
 from providers.azure_devops.work_items import (
@@ -22,6 +26,7 @@ from providers.interfaces import (
     WorkItemContextSnapshot,
     WorkItemTransitionPreview,
     WorkItemTreePreview,
+    WorkItemTreeSnapshot,
     WorkTrackingProvider,
 )
 from workflow_models import (
@@ -185,6 +190,14 @@ class AzureDevOpsWorkTrackingProvider(WorkTrackingProvider):
             ],
             related_items=dict(context.get("relatedItems") or {}),
             development_artifacts=dict(context.get("developmentArtifacts") or {}),
+        )
+
+    def get_work_item_tree(self, *, item_id: int, depth: int = 1) -> WorkItemTreeSnapshot:
+        data = build_work_item_tree(self.token, item_id, depth=depth)
+        return WorkItemTreeSnapshot(
+            root=data["root"],
+            ancestors=list(data["ancestors"]),
+            depth=data["depth"],
         )
 
     def get_work_item_comments(self, *, item_id: int) -> WorkItemCommentsSnapshot:

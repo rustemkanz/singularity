@@ -267,7 +267,13 @@ def cmd_context(args, token, *, build_work_tracking_provider_func=None):
         empty_related = False
         print(f"    {label}:")
         for item in items:
-            print(f"      - [{item['id']}] {item['workItemType']} - {item['state']} - {item['title']}")
+            meta = []
+            if item.get("assignedTo"):
+                meta.append(f"@{item['assignedTo']}")
+            if item.get("tags"):
+                meta.append(f"tags: {', '.join(item['tags'])}")
+            suffix = f"  ({'; '.join(meta)})" if meta else ""
+            print(f"      - [{item['id']}] {item['workItemType']} - {item['state']} - {item['title']}{suffix}")
     if empty_related:
         print("    (none)")
 
@@ -278,6 +284,42 @@ def cmd_context(args, token, *, build_work_tracking_provider_func=None):
         published = (comment.published_date or "")[:19].replace("T", " ")
         print(f"    - {published} {comment.author}:")
         print(f"      {truncate_text(comment.text or '(empty comment)', 220)}")
+    print(f"{'-' * 64}\n")
+
+
+def _format_tree_node_line(node: dict) -> str:
+    meta = []
+    if node.get("assignedTo"):
+        meta.append(f"@{node['assignedTo']}")
+    if node.get("tags"):
+        meta.append(f"tags: {', '.join(node['tags'])}")
+    if node.get("iterationPath"):
+        meta.append(node["iterationPath"])
+    suffix = f"  ({'; '.join(meta)})" if meta else ""
+    return (
+        f"[{node.get('id')}] {node.get('workItemType') or '?'} - "
+        f"{node.get('state') or '?'} - {node.get('title') or ''}{suffix}"
+    )
+
+
+def _print_tree_node(node: dict, depth: int) -> None:
+    print(f"  {'  ' * depth}{_format_tree_node_line(node)}")
+    for child in node.get("children", []):
+        _print_tree_node(child, depth + 1)
+
+
+def cmd_tree(args, token, *, build_work_tracking_provider_func=None):
+    provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
+    depth = max(1, min(getattr(args, "depth", 1) or 1, 3))
+    snapshot = provider.get_work_item_tree(item_id=args.id, depth=depth)
+    if getattr(args, "json", False):
+        print(json.dumps(snapshot.to_legacy_dict(), indent=2))
+        return
+
+    print(f"\n{'-' * 64}")
+    for level, ancestor in enumerate(snapshot.ancestors):
+        print(f"  {'  ' * level}{_format_tree_node_line(ancestor)}  (ancestor)")
+    _print_tree_node(snapshot.root, len(snapshot.ancestors))
     print(f"{'-' * 64}\n")
 
 
@@ -788,6 +830,11 @@ def register_work_item_subcommands(sub):
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
+    p = sub.add_parser("tree", help="Show a work item's parent chain and its child items with assignee/tags")
+    p.add_argument("id", type=work_item_id_arg)
+    p.add_argument("--depth", type=int, default=1, metavar="N", help="Levels of children to expand (1-3, default 1)")
+    p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
+
     p = sub.add_parser("attachments", help="Show or download attachment and screenshot context for a work item")
     p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--images-only", action="store_true", help="Only include image and screenshot references")
@@ -889,6 +936,7 @@ def work_item_command_handlers() -> dict[str, callable]:
         "show": cmd_show,
         "comments": cmd_comments,
         "context": cmd_context,
+        "tree": cmd_tree,
         "attachments": cmd_attachments,
         "introduced-by": cmd_introduced_by,
         "triage": cmd_triage,

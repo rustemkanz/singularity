@@ -414,6 +414,22 @@ class WorkItemCommentsSnapshot:
 
 
 @dataclass(frozen=True)
+class WorkItemTreeSnapshot:
+    """A work item's parent chain plus its descendants to a bounded depth."""
+
+    root: dict
+    ancestors: list[dict]
+    depth: int
+
+    def to_legacy_dict(self) -> dict:
+        return {
+            "root": self.root,
+            "ancestors": list(self.ancestors),
+            "depth": self.depth,
+        }
+
+
+@dataclass(frozen=True)
 class WorkItemTreePreview:
     """A previewed batch of child work items to create under one parent."""
 
@@ -465,6 +481,9 @@ class WorkTrackingProvider(Protocol):
         ...
 
     def get_work_item_comments(self, *, item_id: int) -> WorkItemCommentsSnapshot:
+        ...
+
+    def get_work_item_tree(self, *, item_id: int, depth: int = 1) -> WorkItemTreeSnapshot:
         ...
 
     def get_start_work_plan(self, *, item_id: int) -> StartWorkPlan:

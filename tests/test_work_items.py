@@ -1478,6 +1478,33 @@ class WorkItemTests(unittest.TestCase):
                     args, token="token", build_work_tracking_provider_func=lambda _t: provider,
                 )
 
+    def test_cmd_tree_renders_ancestors_and_children_with_metadata(self):
+        from providers.interfaces import WorkItemTreeSnapshot
+
+        provider = mock.Mock()
+        provider.get_work_item_tree.return_value = WorkItemTreeSnapshot(
+            root={
+                "id": 20, "workItemType": "Feature", "state": "Active", "title": "Feature",
+                "assignedTo": "", "tags": [], "iterationPath": "P\\S1",
+                "children": [
+                    {"id": 30, "workItemType": "User Story", "state": "New", "title": "Story",
+                     "assignedTo": "Alice", "tags": ["v0.0.1"], "iterationPath": "P\\S1", "children": []},
+                ],
+            },
+            ancestors=[{"id": 10, "workItemType": "Epic", "state": "Active", "title": "Epic",
+                        "assignedTo": "", "tags": [], "iterationPath": "", "children": []}],
+            depth=1,
+        )
+        args = argparse.Namespace(id=20, depth=2, json=False)
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            work_item_commands.cmd_tree(args, token="token", build_work_tracking_provider_func=lambda _t: provider)
+
+        out = stdout.getvalue()
+        provider.get_work_item_tree.assert_called_once_with(item_id=20, depth=2)
+        self.assertIn("[10] Epic - Active - Epic  (ancestor)", out)
+        self.assertIn("[30] User Story - New - Story  (@Alice; tags: v0.0.1; P\\S1)", out)
+
     def test_cmd_sprint_json_uses_work_tracking_provider(self):
         args = argparse.Namespace(json=True)
         provider = mock.Mock()
