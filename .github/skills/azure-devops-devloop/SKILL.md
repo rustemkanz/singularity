@@ -56,7 +56,12 @@ sg pr-analyze --url <ado-pr-url>
 sg pr-comments --url <ado-pr-url> --unresolved-only
 sg review <id>
 sg review <id> --apply <PLAN_ID>
+sg tree <id> --depth 2
+sg draft-items <plan-file> --parent <id>
+sg draft-items <plan-file> --parent <id> --apply <PLAN_ID>
 ```
+
+Any `<id>` may be a full work-item URL. `tree` and `team-members` are read-only. `draft-items` creates a whole batch of child work items under one parent from a single Plan ID; show the full parent-to-children tree before asking for approval.
 
 ## Guardrails
 
