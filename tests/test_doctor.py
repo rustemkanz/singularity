@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import io
 import json
+import tempfile
 import unittest
 from unittest import mock
 
@@ -143,12 +144,17 @@ class DoctorCommandTests(unittest.TestCase):
         self.assertIsNone(next((c for c in rendered["checks"] if c["name"] == "pipConfig"), None))
 
     def test_broken_pip_cert_paths_parses_pip_config_output(self):
-        class Result:
-            returncode = 0
-            stdout = "global.cert='/missing/one.pem'\ninstall.cert=/etc/ssl/cert.pem\n"
+        with tempfile.NamedTemporaryFile(suffix=".pem") as existing_bundle:
+            class Result:
+                returncode = 0
+                stdout = (
+                    "global.cert='/no/such/missing-bundle.pem'\n"
+                    f"install.cert={existing_bundle.name}\n"
+                )
 
-        missing = doctor_commands.broken_pip_cert_paths(runner=lambda: Result())
-        self.assertEqual(missing, ["/missing/one.pem"])
+            missing = doctor_commands.broken_pip_cert_paths(runner=lambda: Result())
+
+        self.assertEqual(missing, ["/no/such/missing-bundle.pem"])
 
     def test_cmd_doctor_git_repo_line_is_not_a_contradiction_when_unlinked(self):
         rendered = _run_doctor_json(infer_git_repository_ref_func=lambda: None)
