@@ -147,6 +147,22 @@ class AzureDevOpsWorkTrackingProviderTests(unittest.TestCase):
         self.assertIn("bad type", results[1]["error"])
         self.assertEqual(len(seen), 2)
 
+    def test_list_team_members_maps_identity_fields_and_sorts(self):
+        provider = AzureDevOpsWorkTrackingProvider("token")
+        payload = {
+            "value": [
+                {"identity": {"id": "b", "displayName": "Zoe Q", "uniqueName": "zoe@example.com"}},
+                {"identity": {"id": "a", "displayName": "Amy R", "uniqueName": "amy@example.com"}, "isTeamAdmin": True},
+                {"identity": {}},
+            ]
+        }
+        with mock.patch.object(provider_module, "api", return_value=payload):
+            members = provider.list_team_members(team_id="team-guid")
+
+        self.assertEqual([m.display_name for m in members], ["Amy R", "Zoe Q"])
+        self.assertTrue(members[0].is_admin)
+        self.assertEqual(members[0].unique_name, "amy@example.com")
+
     def test_prepare_transition_rejects_missing_revision(self):
         provider = AzureDevOpsWorkTrackingProvider("token")
         work_item = {

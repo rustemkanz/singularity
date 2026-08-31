@@ -1478,6 +1478,35 @@ class WorkItemTests(unittest.TestCase):
                     args, token="token", build_work_tracking_provider_func=lambda _t: provider,
                 )
 
+    def test_cmd_team_members_uses_configured_team_and_renders(self):
+        from providers.interfaces import TeamMemberRef
+
+        provider = mock.Mock()
+        provider.list_team_members.return_value = [
+            TeamMemberRef(id="a", display_name="Amy R", unique_name="amy@example.com", is_admin=True),
+        ]
+        args = argparse.Namespace(team=None, json=False)
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            work_item_commands.cmd_team_members(
+                args, token="token",
+                build_work_tracking_provider_func=lambda _t: provider,
+                team_id="configured-team",
+            )
+
+        provider.list_team_members.assert_called_once_with(team_id="configured-team")
+        self.assertIn("Amy R  amy@example.com  (admin)", stdout.getvalue())
+
+    def test_cmd_team_members_requires_a_team_id(self):
+        args = argparse.Namespace(team=None, json=False)
+        with mock.patch.object(work_item_commands, "TEAM_ID", ""):
+            with self.assertRaisesRegex(CliError, "No team id"):
+                work_item_commands.cmd_team_members(
+                    args, token="token",
+                    build_work_tracking_provider_func=lambda _t: mock.Mock(),
+                    team_id=None,
+                )
+
     def test_cmd_tree_renders_ancestors_and_children_with_metadata(self):
         from providers.interfaces import WorkItemTreeSnapshot
 

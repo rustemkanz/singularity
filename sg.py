@@ -11,6 +11,7 @@ Commands:
     list            List my open items (New / Ready for development)
     ready-items     Alias for list
     pick-next       Show the next candidate and optionally preview its start plan
+    team-members    List the members of a team (default: AZURE_DEVOPS_TEAM_ID)
     show <id>       Show full details of a work item
     comments <id>   Show work-item comments
     context <id>    Show full work-item context including comments and linked dev artifacts
@@ -150,6 +151,15 @@ def cmd_teams(args, token):
         args,
         token,
         build_work_tracking_provider_func=build_work_tracking_provider,
+    )
+
+
+def cmd_team_members(args, token):
+    return work_item_commands.cmd_team_members(
+        args,
+        token,
+        build_work_tracking_provider_func=build_work_tracking_provider,
+        team_id=TEAM_ID,
     )
 
 
@@ -630,6 +640,7 @@ COMMAND_REQUIRED_CONFIG: dict[str, tuple[str, ...]] = {
     "service-endpoints": ("AZURE_DEVOPS_ORG",),
     "service-endpoint-show": ("AZURE_DEVOPS_ORG",),
     "teams": BASE_COMMAND_REQUIRED_CONFIG,
+    "team-members": BASE_COMMAND_REQUIRED_CONFIG,
     "sprint": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID",),
     "list": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID", "AZURE_DEVOPS_USER"),
     "ready-items": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID", "AZURE_DEVOPS_USER"),
@@ -708,6 +719,8 @@ def required_config_for_command(command: str, args) -> tuple[str, ...]:
         required.append("AZURE_DEVOPS_QA_USER")
     if command == "draft-items" and getattr(args, "assign", None) == "me":
         required.append("AZURE_DEVOPS_USER")
+    if command == "team-members" and not getattr(args, "team", None):
+        required.append("AZURE_DEVOPS_TEAM_ID")
     return tuple(dict.fromkeys(required))
 
 
@@ -750,6 +763,7 @@ def main():
         "ready-items": cmd_list,
         "pick-next":   cmd_pick_next,
         "teams":       cmd_teams,
+        "team-members": cmd_team_members,
         "show":        cmd_show,
         "comments":    cmd_comments,
         "context":     cmd_context,

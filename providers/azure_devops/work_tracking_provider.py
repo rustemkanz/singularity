@@ -21,6 +21,7 @@ from providers.azure_devops.work_items import (
     suggest_start_work_plan,
 )
 from providers.interfaces import (
+    TeamMemberRef,
     TeamRef,
     WorkItemCommentsSnapshot,
     WorkItemContextSnapshot,
@@ -169,6 +170,33 @@ class AzureDevOpsWorkTrackingProvider(WorkTrackingProvider):
             for team in result.get("value", [])
             if team.get("id") and team.get("name")
         ]
+
+    def list_team_members(self, *, team_id: str) -> list[TeamMemberRef]:
+        project_name = urllib.parse.quote(PROJECT)
+        team = urllib.parse.quote(team_id)
+        url = (
+            f"https://dev.azure.com/{ORG}/_apis/projects/{project_name}/teams/{team}/members"
+            f"?api-version=7.1-preview.2"
+        )
+        result = api(self.token, "GET", url)
+        members = []
+        for entry in result.get("value", []):
+            identity = entry.get("identity") or {}
+            member_id = identity.get("id") or ""
+            display_name = identity.get("displayName") or ""
+            unique_name = identity.get("uniqueName") or identity.get("mailAddress") or ""
+            if not display_name and not unique_name:
+                continue
+            members.append(
+                TeamMemberRef(
+                    id=member_id,
+                    display_name=display_name,
+                    unique_name=unique_name,
+                    is_admin=bool(entry.get("isTeamAdmin")),
+                )
+            )
+        members.sort(key=lambda member: member.display_name.casefold())
+        return members
 
     def get_current_sprint(self) -> Sprint:
         return _deserialize_sprint(sprint_required(self.token))

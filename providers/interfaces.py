@@ -40,6 +40,22 @@ class TeamRef:
 
 
 @dataclass(frozen=True)
+class TeamMemberRef:
+    id: str
+    display_name: str
+    unique_name: str
+    is_admin: bool = False
+
+    def to_legacy_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "displayName": self.display_name,
+            "uniqueName": self.unique_name,
+            "isTeamAdmin": self.is_admin,
+        }
+
+
+@dataclass(frozen=True)
 class ReviewContext:
     organization: str
     project: str
@@ -469,6 +485,9 @@ class WorkItemTransitionPreview:
 
 class WorkTrackingProvider(Protocol):
     def list_teams(self) -> list[TeamRef]:
+        ...
+
+    def list_team_members(self, *, team_id: str) -> list[TeamMemberRef]:
         ...
 
     def get_current_sprint(self) -> Sprint:

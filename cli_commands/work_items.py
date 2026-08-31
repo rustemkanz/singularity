@@ -3,7 +3,7 @@ import json
 import os
 
 from errors import CliError
-from app_config import GITLAB_BASE_URL, ME, ORG, PROJECT, QA_EMAIL
+from app_config import GITLAB_BASE_URL, ME, ORG, PROJECT, QA_EMAIL, TEAM_ID
 from mutation_plans import MutationPlan, render_plan_preview, require_approved_plan
 import work_item_authoring
 from work_item_authoring import RECOGNIZED_TYPES
@@ -170,6 +170,32 @@ def cmd_teams(args, token, *, build_work_tracking_provider_func=None):
     for team in teams:
         suffix = f"  {team.description}" if team.description else ""
         print(f"  {team.id}  {team.name}{suffix}")
+    print()
+
+
+def cmd_team_members(args, token, *, build_work_tracking_provider_func=None, team_id: str | None = None):
+    resolved_team = getattr(args, "team", None) or (TEAM_ID if team_id is None else team_id)
+    if not resolved_team:
+        raise CliError(
+            "ERROR: No team id available. Pass --team <id> or set AZURE_DEVOPS_TEAM_ID (see './sg teams')."
+        )
+    provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
+    members = provider.list_team_members(team_id=resolved_team)
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "teamId": resolved_team,
+            "members": [member.to_legacy_dict() for member in members],
+        }, indent=2))
+        return
+
+    print(f"\nMembers of team {resolved_team}:\n")
+    if not members:
+        print("  (none)\n")
+        return
+    for member in members:
+        admin = "  (admin)" if member.is_admin else ""
+        identity = f"  {member.unique_name}" if member.unique_name else ""
+        print(f"  {member.display_name}{identity}{admin}")
     print()
 
 
@@ -808,6 +834,10 @@ def register_work_item_subcommands(sub):
     p = sub.add_parser("teams", help="List Azure DevOps teams in the project")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
+    p = sub.add_parser("team-members", help="List the members of a team (defaults to AZURE_DEVOPS_TEAM_ID)")
+    p.add_argument("--team", metavar="ID", help="Team id or name (default: AZURE_DEVOPS_TEAM_ID)")
+    p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
+
     p = sub.add_parser("show", help="Show full details of a work item")
     p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
@@ -933,6 +963,7 @@ def work_item_command_handlers() -> dict[str, callable]:
         "ready-items": cmd_list,
         "pick-next": cmd_pick_next,
         "teams": cmd_teams,
+        "team-members": cmd_team_members,
         "show": cmd_show,
         "comments": cmd_comments,
         "context": cmd_context,
