@@ -11,9 +11,11 @@ Commands:
     list            List my open items (New / Ready for development)
     ready-items     Alias for list
     pick-next       Show the next candidate and optionally preview its start plan
+    team-members    List the members of a team (default: AZURE_DEVOPS_TEAM_ID)
     show <id>       Show full details of a work item
     comments <id>   Show work-item comments
     context <id>    Show full work-item context including comments and linked dev artifacts
+    tree <id>       Show a work item's parent chain and child items with assignee/tags
     attachments <id> Show or download attachment and screenshot context
     introduced-by <id> Show linked PR/commit candidates that likely introduced a bug
     triage <ids...> Summarize several work items and suggest grouping for PRs
@@ -23,6 +25,7 @@ Commands:
     handoff-to-qa   Alias for testing
     create-pr       Preview a pull request; apply by exact Plan ID
     comment <id>    Preview a work-item comment; apply by exact Plan ID
+    draft-items <plan> Preview child work items from a plan file; create by exact Plan ID
     repos           List git repositories in the project
     pr-analyze      Summarize a PR from a URL or repo/PR reference
     pr-files        List changed files for a PR
@@ -45,6 +48,8 @@ Commands:
     queue-build     Preview queueing a new pipeline run
     service-endpoints List Azure DevOps service connections/endpoints
     service-endpoint-show Show one Azure DevOps service connection/endpoint
+    profiles        List project profiles and show the active one
+    use             Set or clear the active project profile
     doctor          Check Azure CLI auth, project access, and repo resolution
 """
 
@@ -55,6 +60,7 @@ import sys
 import urllib.parse
 from cli_commands import builds as build_commands
 from cli_commands import doctor as doctor_commands
+from cli_commands import profiles as profile_commands
 from cli_commands import review as review_commands
 from cli_commands import service_endpoints as service_endpoint_commands
 from cli_commands import work_items as work_item_commands
@@ -151,6 +157,15 @@ def cmd_teams(args, token):
     )
 
 
+def cmd_team_members(args, token):
+    return work_item_commands.cmd_team_members(
+        args,
+        token,
+        build_work_tracking_provider_func=build_work_tracking_provider,
+        team_id=TEAM_ID,
+    )
+
+
 def cmd_show(args, token):
     return work_item_commands.cmd_show(
         args,
@@ -164,6 +179,14 @@ def cmd_context(args, token):
         args,
         token,
         build_work_tracking_provider_func=lambda token_value: build_work_tracking_provider_for_args(token_value, args),
+    )
+
+
+def cmd_tree(args, token):
+    return work_item_commands.cmd_tree(
+        args,
+        token,
+        build_work_tracking_provider_func=build_work_tracking_provider,
     )
 
 
@@ -244,6 +267,15 @@ def cmd_comment(args, token):
         args,
         token,
         build_work_tracking_provider_func=lambda token_value: build_work_tracking_provider_for_args(token_value, args),
+    )
+
+
+def cmd_draft_items(args, token):
+    return work_item_commands.cmd_draft_items(
+        args,
+        token,
+        build_work_tracking_provider_func=build_work_tracking_provider,
+        me=ME,
     )
 
 
@@ -575,6 +607,14 @@ def cmd_pr_statuses(args, token):
     )
 
 
+def cmd_profiles(args, _token=None):
+    return profile_commands.cmd_profiles(args, _token)
+
+
+def cmd_use(args, _token=None):
+    return profile_commands.cmd_use(args, _token)
+
+
 def cmd_doctor(args, _token=None):
     return doctor_commands.cmd_doctor(
         args,
@@ -602,6 +642,8 @@ def cmd_doctor(args, _token=None):
 BASE_COMMAND_REQUIRED_CONFIG = ("AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PROJECT")
 COMMAND_REQUIRED_CONFIG: dict[str, tuple[str, ...]] = {
     "doctor": (),
+    "profiles": (),
+    "use": (),
     "builds": ("AZURE_DEVOPS_ORG",),
     "build-status": ("AZURE_DEVOPS_ORG",),
     "build-approvals": ("AZURE_DEVOPS_ORG",),
@@ -611,6 +653,7 @@ COMMAND_REQUIRED_CONFIG: dict[str, tuple[str, ...]] = {
     "service-endpoints": ("AZURE_DEVOPS_ORG",),
     "service-endpoint-show": ("AZURE_DEVOPS_ORG",),
     "teams": BASE_COMMAND_REQUIRED_CONFIG,
+    "team-members": BASE_COMMAND_REQUIRED_CONFIG,
     "sprint": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID",),
     "list": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID", "AZURE_DEVOPS_USER"),
     "ready-items": BASE_COMMAND_REQUIRED_CONFIG + ("AZURE_DEVOPS_TEAM_ID", "AZURE_DEVOPS_USER"),
@@ -674,7 +717,7 @@ def uses_gitlab_work_tracking_provider(command: str, args) -> bool:
 
 
 def resolve_command_token(args):
-    if args.command == "doctor":
+    if args.command in {"doctor", "profiles", "use"}:
         return None
     if uses_gitlab_review_provider(args.command, args) or uses_gitlab_work_tracking_provider(args.command, args):
         return GITLAB_TOKEN or ""
@@ -687,6 +730,10 @@ def required_config_for_command(command: str, args) -> tuple[str, ...]:
         required = []
     if command in {"testing", "handoff-to-qa"} and not getattr(args, "qa", None):
         required.append("AZURE_DEVOPS_QA_USER")
+    if command == "draft-items" and getattr(args, "assign", None) == "me":
+        required.append("AZURE_DEVOPS_USER")
+    if command == "team-members" and not getattr(args, "team", None):
+        required.append("AZURE_DEVOPS_TEAM_ID")
     return tuple(dict.fromkeys(required))
 
 
@@ -719,6 +766,7 @@ def main():
     review_commands.register_review_subcommands(sub)
     build_commands.register_build_subcommands(sub)
     service_endpoint_commands.register_service_endpoint_subcommands(sub)
+    profile_commands.register_profile_subcommands(sub)
     doctor_commands.register_doctor_subcommands(sub)
 
     args = parser.parse_args()
@@ -729,9 +777,11 @@ def main():
         "ready-items": cmd_list,
         "pick-next":   cmd_pick_next,
         "teams":       cmd_teams,
+        "team-members": cmd_team_members,
         "show":        cmd_show,
         "comments":    cmd_comments,
         "context":     cmd_context,
+        "tree":        cmd_tree,
         "attachments": cmd_attachments,
         "introduced-by": cmd_introduced_by,
         "triage":      cmd_triage,
@@ -741,6 +791,7 @@ def main():
         "handoff-to-qa": cmd_handoff_to_qa,
         "create-pr":   cmd_create_pr,
         "comment":     cmd_comment,
+        "draft-items": cmd_draft_items,
         "cleanup-artifacts": cmd_cleanup_artifacts,
         "repos":       cmd_repos,
         "pr-analyze":  cmd_pr_analyze,
@@ -764,6 +815,8 @@ def main():
         "queue-build":  cmd_queue_build,
         "service-endpoints": cmd_service_endpoints,
         "service-endpoint-show": cmd_service_endpoint_show,
+        "profiles":     cmd_profiles,
+        "use":          cmd_use,
         "doctor":       cmd_doctor,
     }
     try:

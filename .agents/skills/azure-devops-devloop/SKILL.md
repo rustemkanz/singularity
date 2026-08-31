@@ -38,7 +38,9 @@ sg show <id>
 sg comments <id> --latest 5
 ```
 
-Use `sg context <id>` when linked work items, PRs, or commits matter. Use `sg attachments <id>` when screenshot evidence matters; inspect listed destinations and never weaken TLS or credential-scope checks.
+Use `sg context <id>` when linked work items, PRs, or commits matter, or `sg tree <id>` for a parent chain plus child items with state, assignee, and tags. Use `sg attachments <id>` when screenshot evidence matters; inspect listed destinations and never weaken TLS or credential-scope checks. Any `<id>` may be a full work-item URL.
+
+To backfill tracking items after implementing planned work, `sg draft-items <plan-file> --parent <id>` previews a batch of child work items under one parent and creates them only with the exact Plan ID. It is create-only and covers the whole batch with a single approval; show the full parent-to-children tree before asking. `sg team-members` lists the configured team's members.
 
 Decide whether the description, repro steps, acceptance criteria, comments, and evidence make the work implementable. The CLI does not make this decision.
 

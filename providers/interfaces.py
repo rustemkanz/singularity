@@ -40,6 +40,22 @@ class TeamRef:
 
 
 @dataclass(frozen=True)
+class TeamMemberRef:
+    id: str
+    display_name: str
+    unique_name: str
+    is_admin: bool = False
+
+    def to_legacy_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "displayName": self.display_name,
+            "uniqueName": self.unique_name,
+            "isTeamAdmin": self.is_admin,
+        }
+
+
+@dataclass(frozen=True)
 class ReviewContext:
     organization: str
     project: str
@@ -414,6 +430,40 @@ class WorkItemCommentsSnapshot:
 
 
 @dataclass(frozen=True)
+class WorkItemTreeSnapshot:
+    """A work item's parent chain plus its descendants to a bounded depth."""
+
+    root: dict
+    ancestors: list[dict]
+    depth: int
+
+    def to_legacy_dict(self) -> dict:
+        return {
+            "root": self.root,
+            "ancestors": list(self.ancestors),
+            "depth": self.depth,
+        }
+
+
+@dataclass(frozen=True)
+class WorkItemTreePreview:
+    """A previewed batch of child work items to create under one parent."""
+
+    provider: str
+    parent_id: int
+    parent_snapshot: dict
+    requests: list
+
+    def to_plan_payload(self) -> dict:
+        return {
+            "provider": self.provider,
+            "parentWorkItemId": self.parent_id,
+            "parentSnapshot": copy.deepcopy(self.parent_snapshot),
+            "requests": copy.deepcopy(self.requests),
+        }
+
+
+@dataclass(frozen=True)
 class WorkItemTransitionPreview:
     provider: str
     item_id: int
@@ -437,6 +487,9 @@ class WorkTrackingProvider(Protocol):
     def list_teams(self) -> list[TeamRef]:
         ...
 
+    def list_team_members(self, *, team_id: str) -> list[TeamMemberRef]:
+        ...
+
     def get_current_sprint(self) -> Sprint:
         ...
 
@@ -447,6 +500,9 @@ class WorkTrackingProvider(Protocol):
         ...
 
     def get_work_item_comments(self, *, item_id: int) -> WorkItemCommentsSnapshot:
+        ...
+
+    def get_work_item_tree(self, *, item_id: int, depth: int = 1) -> WorkItemTreeSnapshot:
         ...
 
     def get_start_work_plan(self, *, item_id: int) -> StartWorkPlan:
@@ -471,6 +527,19 @@ class WorkTrackingProvider(Protocol):
         ...
 
     def add_work_item_comment(self, *, item_id: int, text: str) -> int | None:
+        ...
+
+    def prepare_work_item_tree(
+        self,
+        *,
+        parent_id: int,
+        items: list,
+        tags: list[str] | None = None,
+        assignee: str | None = None,
+    ) -> WorkItemTreePreview:
+        ...
+
+    def apply_prepared_work_item_tree(self, preview: WorkItemTreePreview, *, on_result=None) -> list[dict]:
         ...
 
 

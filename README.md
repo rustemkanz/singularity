@@ -32,9 +32,12 @@ The repo does not claim general artificial superintelligence. The point is narro
 The current implementation ships the broadest support for Azure DevOps today, alongside an initial GitLab workflow slice, and supports workflows such as:
 
 - Finding the current sprint and listing candidate items.
-- Inspecting work item details, comments, context, and attachments.
+- Inspecting work item details, comments, context, parent/child trees, and attachments.
+- Listing project teams and their members.
 - Starting work and suggesting branch, note, and PR metadata.
 - Creating pull requests and moving work items through review and testing states.
+- Creating a previewed, approval-gated batch of child work items under a parent from a plan file (`draft-items`).
+- Switching between projects with named environment profiles (`profiles` / `use`).
 - Inspecting PR files, diffs, comments, and review threads.
 - Drafting, posting, editing, replying to, and resolving review comments.
 - Inspecting build status with failure-tail summaries, delta-oriented watch output, visible build reasons, task log ids, stage or active or failed filters, richer pending explanations, direct build step logs, latest matching builds by branch or commit, duplicate-safe build queueing, and optionally approving pending pipeline gates while watching.
@@ -55,7 +58,7 @@ Singularity is not trying to replace the official Azure DevOps platform surfaces
 - The Azure DevOps Python API is a thin SDK for programmatic access to the REST APIs.
 - Azure DevOps MCP exposes many Azure DevOps tools directly to agents.
 
-Singularity sits one layer above those. Its value is opinionated workflow orchestration: inspect the work item, decide whether clarification is needed, gather attachment context, start work when ready, prepare the branch and PR flow, and handle review follow-up with explicit approval points.
+Singularity sits one layer above those. Its value is opinionated workflow orchestration: inspect the work item, decide whether clarification is needed, gather attachment context, start work when ready, prepare the branch and PR flow, and handle review follow-up with explicit approval points. The one write path it adds for work items themselves is `draft-items` — a plan file becomes a previewed tree of child items under one parent, behind a single Plan ID. Generic field, tag, and state edits, and bulk changes, stay with `az boards` and the Azure DevOps MCP server.
 
 Azure DevOps still has the broadest workflow surface today, but GitLab now supports helper-driven issue transitions, merge-request creation, top-level and inline review comments, replies, edits, resolution, and disposable-artifact cleanup.
 
@@ -172,6 +175,44 @@ sg create-pr 123456 --repo your-repo --source fix/123456-example --apply <PLAN_I
 ```
 
 Every mutation follows the same two-invocation contract: preview without `--apply`, then rerun the otherwise unchanged command with `--apply <PLAN_ID>`. The full `sha256:` ID binds the action, provider target, payload, verified Git worktree identity, and a short-lived nonce. It is stored locally as a one-shot approval grant, expires after one hour, and is consumed before the provider request begins. If any material input or provider-derived default changes, the command needs a fresh preview and approval. If a provider request times out or otherwise has an ambiguous result, inspect provider state before previewing a retry so an action that actually succeeded is not duplicated.
+
+Every command that takes a work-item `id` also accepts a full work-item URL in its place (for example `sg show https://dev.azure.com/<org>/<project>/_workitems/edit/123456` or a GitLab `.../-/issues/<iid>` URL).
+
+### Authoring work items
+
+Singularity does not offer a generic work-item editor; arbitrary field, tag, and state edits belong to `az boards` or the Azure DevOps MCP server. It does offer one narrow, plan-anchored create path.
+
+`draft-items` turns a plan file into a previewed batch of child work items under one existing parent. It is create-only, inherits the parent's area and iteration path, and writes only a fixed field set (type, title, description, tags, assignee). The whole batch is covered by a single Plan ID.
+
+```bash
+sg draft-items ./plan.md --parent 812345 --tag v0.0.1
+# After approving that exact displayed Plan ID:
+sg draft-items ./plan.md --parent 812345 --tag v0.0.1 --apply <PLAN_ID>
+```
+
+The plan file is either Markdown or `.json`. In Markdown, each `## <title>` heading is one child item: a leading `P1 —` style label is stripped, a `[Bug]` / `[User Story]` / `[Task]` token in the heading sets the type (otherwise `--default-type`, default `User Story`), and the section body becomes the description. The `.json` form is `{"items": [{"title": ..., "type": ..., "description": ..., "tags": [...], "assignedTo": ...}]}`, where per-item `tags` and `assignedTo` override the command defaults.
+
+Two read helpers round out the loop:
+
+```bash
+sg tree 812345 --depth 2          # parent chain + child items with state, assignee, tags
+sg team-members                   # members of AZURE_DEVOPS_TEAM_ID (or --team <id>)
+```
+
+`sg context <id>` now also shows assignee and tags on each related item.
+
+### Project profiles
+
+When you work across several Azure DevOps projects, keep one `<name>.env` file per project under `~/.config/singularity/profiles/` (or `$XDG_CONFIG_HOME/singularity/profiles/`). The active profile is layered on top of `.env.local` / `.env`; real environment variables still win.
+
+```bash
+sg profiles                # list profiles and show the active one
+sg use acme-web               # persist 'acme-web' as the active profile (local marker file)
+SG_PROFILE=acme-api sg doctor   # or select one for a single invocation
+sg use --clear             # back to .env.local / .env only
+```
+
+`sg doctor` reports the active profile and, when none is set, lists what is available.
 
 ### Starting work
 

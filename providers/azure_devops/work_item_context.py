@@ -1008,6 +1008,9 @@ def serialize_related_item(fields: dict) -> RelatedWorkItem:
         title=fields.get("System.Title", ""),
         kind=fields.get("System.WorkItemType", ""),
         state=fields.get("System.State", ""),
+        assignee=assigned_display_name(fields.get("System.AssignedTo")) if fields.get("System.AssignedTo") else "",
+        tags=tuple(split_tags(fields.get("System.Tags", ""))),
+        iteration=fields.get("System.IterationPath", ""),
     )
 
 
@@ -1030,13 +1033,80 @@ def collect_related_items(token: str, item: dict) -> dict[str, list[dict]]:
         for fields in fetch_items(
             token,
             all_ids,
-            ["System.Id", "System.Title", "System.WorkItemType", "System.State"],
+            [
+                "System.Id",
+                "System.Title",
+                "System.WorkItemType",
+                "System.State",
+                "System.AssignedTo",
+                "System.Tags",
+                "System.IterationPath",
+            ],
         )
     }
     return {
         group: [fields_by_id[item_id].to_legacy_dict() for item_id in ids if item_id in fields_by_id]
         for group, ids in grouped_ids.items()
     }
+
+
+_TREE_HIERARCHY_FORWARD = "System.LinkTypes.Hierarchy-Forward"
+_TREE_HIERARCHY_REVERSE = "System.LinkTypes.Hierarchy-Reverse"
+_TREE_NODE_BUDGET = 200
+_TREE_ANCESTOR_LIMIT = 10
+
+
+def _hierarchy_related_ids(item: dict, rel: str) -> list[int]:
+    ids: list[int] = []
+    for relation in item.get("relations", []):
+        if relation.get("rel") == rel:
+            related_id = extract_work_item_id_from_relation_url(relation.get("url", ""))
+            if related_id is not None:
+                ids.append(related_id)
+    return ids
+
+
+def _tree_node_dict(item: dict, children: list[dict]) -> dict:
+    node = serialize_related_item(item.get("fields") or {}).to_legacy_dict()
+    node["children"] = children
+    return node
+
+
+def build_work_item_tree(token: str, item_id: int, *, depth: int = 1) -> dict:
+    """Return the item's parent chain plus its descendants to ``depth`` levels."""
+    budget = {"remaining_nodes": _TREE_NODE_BUDGET}
+    root_item = fetch_work_item(token, item_id, expand="relations")
+    if not root_item:
+        raise CliError(f"Work item {item_id} not found.")
+
+    def build_subtree(item: dict, levels_left: int) -> dict:
+        budget["remaining_nodes"] -= 1
+        children: list[dict] = []
+        if levels_left > 0:
+            for child_id in _hierarchy_related_ids(item, _TREE_HIERARCHY_FORWARD):
+                if budget["remaining_nodes"] <= 0:
+                    break
+                child_item = fetch_work_item(token, child_id, expand="relations")
+                if child_item:
+                    children.append(build_subtree(child_item, levels_left - 1))
+        return _tree_node_dict(item, children)
+
+    root = build_subtree(root_item, max(0, depth))
+
+    ancestors: list[dict] = []
+    current = root_item
+    for _ in range(_TREE_ANCESTOR_LIMIT):
+        parent_ids = _hierarchy_related_ids(current, _TREE_HIERARCHY_REVERSE)
+        if not parent_ids:
+            break
+        parent_item = fetch_work_item(token, parent_ids[0], expand="relations")
+        if not parent_item:
+            break
+        ancestors.append(_tree_node_dict(parent_item, []))
+        current = parent_item
+    ancestors.reverse()
+
+    return {"root": root, "ancestors": ancestors, "depth": max(0, depth)}
 
 
 def parse_git_artifact_link(url: str) -> dict | None:

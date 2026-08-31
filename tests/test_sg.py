@@ -118,6 +118,43 @@ class SgEntrypointTests(unittest.TestCase):
         self.assertEqual(exit_context.exception.code, 2)
         self.assertIn("--repo", stderr.getvalue())
 
+    def test_profiles_and_use_need_no_azure_config_and_no_token(self):
+        for command, extra in (("profiles", []), ("use", ["--clear"])):
+            with self.subTest(command=command):
+                self.assertEqual(sg.COMMAND_REQUIRED_CONFIG[command], ())
+                captured = {}
+
+                def fake(args, token=None):
+                    captured["token"] = token
+
+                with (
+                    mock.patch.object(sg, f"cmd_{command.replace('-', '_')}", side_effect=fake),
+                    mock.patch.object(sg, "get_token", side_effect=AssertionError("no token expected")),
+                    mock.patch.object(sys, "argv", ["sg", command, *extra]),
+                ):
+                    sg.main()
+                self.assertIsNone(captured["token"])
+
+    def test_work_item_commands_accept_a_work_item_url_in_place_of_an_id(self):
+        captured = {}
+
+        def fake_show(args, token):
+            captured["id"] = args.id
+
+        with (
+            mock.patch.object(sg, "cmd_show", side_effect=fake_show),
+            mock.patch.object(sg, "missing_required_config", return_value=[]),
+            mock.patch.object(sg, "get_token", return_value="azure-token"),
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sg", "show", "https://dev.azure.com/contoso/Widgets/_workitems/edit/321"],
+            ),
+        ):
+            sg.main()
+
+        self.assertEqual(captured["id"], 321)
+
     def test_removed_start_work_and_prepare_review_commands_are_rejected(self):
         for command in ("start-work", "prepare-review"):
             with self.subTest(command=command):

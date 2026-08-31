@@ -2,8 +2,12 @@ import urllib.parse
 import copy
 
 from errors import CliError
-from providers.azure_devops.work_item_context import build_work_item_comments, build_work_item_context
-from app_config import BASE_URL, ORG, PROJECT
+from providers.azure_devops.work_item_context import (
+    build_work_item_comments,
+    build_work_item_context,
+    build_work_item_tree,
+)
+from app_config import API_VER, BASE_URL, ORG, PROJECT
 from providers.azure_devops.http import api
 from providers.azure_devops.work_items import (
     build_triage_report,
@@ -17,10 +21,13 @@ from providers.azure_devops.work_items import (
     suggest_start_work_plan,
 )
 from providers.interfaces import (
+    TeamMemberRef,
     TeamRef,
     WorkItemCommentsSnapshot,
     WorkItemContextSnapshot,
     WorkItemTransitionPreview,
+    WorkItemTreePreview,
+    WorkItemTreeSnapshot,
     WorkTrackingProvider,
 )
 from workflow_models import (
@@ -164,6 +171,33 @@ class AzureDevOpsWorkTrackingProvider(WorkTrackingProvider):
             if team.get("id") and team.get("name")
         ]
 
+    def list_team_members(self, *, team_id: str) -> list[TeamMemberRef]:
+        project_name = urllib.parse.quote(PROJECT)
+        team = urllib.parse.quote(team_id)
+        url = (
+            f"https://dev.azure.com/{ORG}/_apis/projects/{project_name}/teams/{team}/members"
+            f"?api-version=7.1-preview.2"
+        )
+        result = api(self.token, "GET", url)
+        members = []
+        for entry in result.get("value", []):
+            identity = entry.get("identity") or {}
+            member_id = identity.get("id") or ""
+            display_name = identity.get("displayName") or ""
+            unique_name = identity.get("uniqueName") or identity.get("mailAddress") or ""
+            if not display_name and not unique_name:
+                continue
+            members.append(
+                TeamMemberRef(
+                    id=member_id,
+                    display_name=display_name,
+                    unique_name=unique_name,
+                    is_admin=bool(entry.get("isTeamAdmin")),
+                )
+            )
+        members.sort(key=lambda member: member.display_name.casefold())
+        return members
+
     def get_current_sprint(self) -> Sprint:
         return _deserialize_sprint(sprint_required(self.token))
 
@@ -184,6 +218,14 @@ class AzureDevOpsWorkTrackingProvider(WorkTrackingProvider):
             ],
             related_items=dict(context.get("relatedItems") or {}),
             development_artifacts=dict(context.get("developmentArtifacts") or {}),
+        )
+
+    def get_work_item_tree(self, *, item_id: int, depth: int = 1) -> WorkItemTreeSnapshot:
+        data = build_work_item_tree(self.token, item_id, depth=depth)
+        return WorkItemTreeSnapshot(
+            root=data["root"],
+            ancestors=list(data["ancestors"]),
+            depth=data["depth"],
         )
 
     def get_work_item_comments(self, *, item_id: int) -> WorkItemCommentsSnapshot:
@@ -300,3 +342,119 @@ class AzureDevOpsWorkTrackingProvider(WorkTrackingProvider):
         url = f"{BASE_URL}/_apis/wit/workitems/{item_id}/comments?api-version=7.1-preview.3"
         result = api(self.token, "POST", url, {"text": text})
         return result.get("id")
+
+    def prepare_work_item_tree(
+        self,
+        *,
+        parent_id: int,
+        items: list,
+        tags: list[str] | None = None,
+        assignee: str | None = None,
+    ) -> WorkItemTreePreview:
+        parent = fetch_work_item(
+            self.token,
+            parent_id,
+            fields=[
+                "System.Id",
+                "System.Title",
+                "System.WorkItemType",
+                "System.TeamProject",
+                "System.AreaPath",
+                "System.IterationPath",
+            ],
+        )
+        fields = parent.get("fields") or {}
+        area_path = fields.get("System.AreaPath")
+        iteration_path = fields.get("System.IterationPath")
+        parent_url = f"{BASE_URL}/_apis/wit/workItems/{parent_id}"
+        default_tags = tuple(tags or ())
+
+        requests: list[dict] = []
+        for spec in items:
+            spec_tags = spec.tags if spec.tags is not None else default_tags
+            spec_assignee = spec.assigned_to if spec.assigned_to is not None else assignee
+            operations: list[dict] = [
+                {"op": "add", "path": "/fields/System.Title", "value": spec.title},
+            ]
+            if spec.description_html:
+                operations.append(
+                    {"op": "add", "path": "/fields/System.Description", "value": spec.description_html}
+                )
+            if spec_tags:
+                operations.append(
+                    {"op": "add", "path": "/fields/System.Tags", "value": "; ".join(spec_tags)}
+                )
+            if spec_assignee:
+                operations.append(
+                    {"op": "add", "path": "/fields/System.AssignedTo", "value": spec_assignee}
+                )
+            if area_path:
+                operations.append(
+                    {"op": "add", "path": "/fields/System.AreaPath", "value": area_path}
+                )
+            if iteration_path:
+                operations.append(
+                    {"op": "add", "path": "/fields/System.IterationPath", "value": iteration_path}
+                )
+            operations.append(
+                {
+                    "op": "add",
+                    "path": "/relations/-",
+                    "value": {
+                        "rel": "System.LinkTypes.Hierarchy-Reverse",
+                        "url": parent_url,
+                    },
+                }
+            )
+            requests.append({"type": spec.type, "title": spec.title, "operations": operations})
+
+        return WorkItemTreePreview(
+            provider="azure-devops",
+            parent_id=parent_id,
+            parent_snapshot={
+                "id": fields.get("System.Id") or parent_id,
+                "title": fields.get("System.Title") or "",
+                "type": fields.get("System.WorkItemType") or "",
+                "areaPath": area_path or "",
+                "iterationPath": iteration_path or "",
+            },
+            requests=requests,
+        )
+
+    def apply_prepared_work_item_tree(
+        self,
+        preview: WorkItemTreePreview,
+        *,
+        on_result=None,
+    ) -> list[dict]:
+        if preview.provider != "azure-devops":
+            raise CliError(
+                f"ERROR: Cannot apply a {preview.provider!r} work-item tree with the Azure DevOps provider."
+            )
+        results: list[dict] = []
+        for request in preview.requests:
+            work_item_type = request.get("type")
+            title = request.get("title")
+            operations = request.get("operations")
+            if not isinstance(work_item_type, str) or not isinstance(operations, list):
+                raise CliError("ERROR: Prepared work-item tree request is invalid.")
+            url = (
+                f"{BASE_URL}/_apis/wit/workitems/"
+                f"${urllib.parse.quote(work_item_type)}?api-version={API_VER}"
+            )
+            try:
+                created = api(
+                    self.token,
+                    "POST",
+                    url,
+                    copy.deepcopy(operations),
+                    content_type="application/json-patch+json",
+                )
+            except CliError as exc:
+                entry = {"title": title, "ok": False, "error": str(exc)}
+            else:
+                entry = {"title": title, "ok": True, "id": created.get("id")}
+            results.append(entry)
+            if on_result is not None:
+                on_result(entry)
+        return results

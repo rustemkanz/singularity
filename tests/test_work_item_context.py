@@ -81,6 +81,57 @@ class SequenceDownloadOpener:
         return response
 
 
+class WorkItemTreeTests(unittest.TestCase):
+    @staticmethod
+    def _item(item_id, kind, *, parent=None, children=(), assignee=None, tags=""):
+        relations = []
+        if parent is not None:
+            relations.append({
+                "rel": "System.LinkTypes.Hierarchy-Reverse",
+                "url": f"https://dev.azure.com/o/p/_apis/wit/workItems/{parent}",
+            })
+        for child in children:
+            relations.append({
+                "rel": "System.LinkTypes.Hierarchy-Forward",
+                "url": f"https://dev.azure.com/o/p/_apis/wit/workItems/{child}",
+            })
+        return {
+            "fields": {
+                "System.Id": item_id,
+                "System.Title": f"Item {item_id}",
+                "System.WorkItemType": kind,
+                "System.State": "New",
+                "System.AssignedTo": {"displayName": assignee} if assignee else None,
+                "System.Tags": tags,
+                "System.IterationPath": "Proj\\Sprint 1",
+            },
+            "relations": relations,
+        }
+
+    def test_build_tree_collects_ancestors_and_bounded_children(self):
+        items = {
+            10: self._item(10, "Epic", children=[20]),
+            20: self._item(20, "Feature", parent=10, children=[30, 31]),
+            30: self._item(30, "User Story", parent=20, assignee="Alice", tags="v0.0.1"),
+            31: self._item(31, "Bug", parent=20),
+        }
+
+        with mock.patch.object(
+            provider_work_item_context,
+            "fetch_work_item",
+            side_effect=lambda token, item_id, **kwargs: items.get(item_id),
+        ):
+            tree = provider_work_item_context.build_work_item_tree("token", 20, depth=1)
+
+        self.assertEqual([node["id"] for node in tree["ancestors"]], [10])
+        self.assertEqual(tree["root"]["id"], 20)
+        self.assertEqual([child["id"] for child in tree["root"]["children"]], [30, 31])
+        self.assertEqual(tree["root"]["children"][0]["assignedTo"], "Alice")
+        self.assertEqual(tree["root"]["children"][0]["tags"], ["v0.0.1"])
+        # depth=1 stops before grandchildren
+        self.assertEqual(tree["root"]["children"][0]["children"], [])
+
+
 class WorkItemContextTests(unittest.TestCase):
     def test_work_item_text_fields_include_repro_steps(self):
         self.assertIn(

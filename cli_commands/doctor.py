@@ -1,10 +1,52 @@
 import json
+import os
+import re
 import shutil
+import subprocess
+import sys
 
-from app_config import DEFAULT_REPO, ME, ORG, PROJECT, TEAM_ID, configuration_warnings, missing_required_config
+from app_config import (
+    ACTIVE_PROFILE,
+    ACTIVE_PROFILE_SOURCE,
+    DEFAULT_REPO,
+    ME,
+    ORG,
+    PROJECT,
+    TEAM_ID,
+    configuration_warnings,
+    missing_required_config,
+)
 from errors import CliError
 from git_client import current_git_branch, infer_git_repository_ref
+from profiles import list_profiles, profiles_dir
 from providers.azure_devops.auth import probe_azure_token
+
+
+_PIP_CERT_RE = re.compile(r"^(?:global|install)\.cert\s*=\s*(.+?)\s*$", re.MULTILINE)
+
+
+def broken_pip_cert_paths(runner=None) -> list[str]:
+    """Return configured pip cert files that do not exist (blocks 'pip install')."""
+    run = runner or (
+        lambda: subprocess.run(
+            [sys.executable, "-m", "pip", "config", "list"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    )
+    try:
+        result = run()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if getattr(result, "returncode", 1) != 0:
+        return []
+    missing: list[str] = []
+    for raw_path in _PIP_CERT_RE.findall(result.stdout or ""):
+        cert_path = raw_path.strip().strip("'\"")
+        if cert_path and not os.path.isfile(os.path.expanduser(cert_path)) and cert_path not in missing:
+            missing.append(cert_path)
+    return missing
 
 
 def cmd_doctor(
@@ -17,6 +59,7 @@ def cmd_doctor(
     missing_required_config_func=None,
     list_repositories_func=None,
     match_repository_func=None,
+    broken_pip_cert_paths_func=None,
     org: str | None = None,
     project: str | None = None,
     team_id: str | None = None,
@@ -89,7 +132,7 @@ def cmd_doctor(
             "detail": (
                 f"Inferred current git origin repository as {git_repo}."
                 if git_repo is not None
-                else "Could not infer an Azure DevOps repository from the current git origin."
+                else "No Azure DevOps repository is linked to the current git origin (expected outside a target work repo)."
             ),
             "hints": (
                 []
@@ -154,6 +197,40 @@ def cmd_doctor(
                 "hints": ["Run repo-aware commands from a target work repo, pass --repo, or set AZURE_DEVOPS_DEFAULT_REPO."],
             })
 
+    broken_pip_certs = (broken_pip_cert_paths_func or broken_pip_cert_paths)()
+    if broken_pip_certs:
+        checks.append({
+            "name": "pipConfig",
+            "ok": False,
+            "detail": (
+                "pip is configured with a CA bundle that does not exist: "
+                f"{', '.join(broken_pip_certs)}. 'pip install' fails before it starts."
+            ),
+            "hints": [
+                "Fix or unset global.cert / install.cert (pip config unset global.cert), "
+                "or install with 'pip install --cert <valid-bundle> --no-build-isolation'.",
+            ],
+        })
+
+    available_profiles = list_profiles()
+    if not ACTIVE_PROFILE and available_profiles:
+        checks.append({
+            "name": "profile",
+            "ok": True,
+            "detail": "No active project profile; using .env.local / .env only.",
+            "hints": [
+                f"Available profiles: {', '.join(available_profiles)}. "
+                "Select one with './sg use <name>' or SG_PROFILE=<name>."
+            ],
+        })
+    elif ACTIVE_PROFILE:
+        checks.append({
+            "name": "profile",
+            "ok": True,
+            "detail": f"Active project profile '{ACTIVE_PROFILE}' (from {ACTIVE_PROFILE_SOURCE}).",
+            "hints": [],
+        })
+
     payload = {
         "organization": org_name,
         "project": project_name,
@@ -162,6 +239,9 @@ def cmd_doctor(
         "defaultRepo": fallback_repo,
         "currentBranch": current_branch,
         "currentRepo": git_repo,
+        "activeProfile": ACTIVE_PROFILE,
+        "activeProfileSource": ACTIVE_PROFILE_SOURCE,
+        "profilesDir": str(profiles_dir()),
         "checks": checks,
     }
     if args.json:
@@ -171,6 +251,8 @@ def cmd_doctor(
     print("\nSingularity doctor\n")
     print(f"  Organization : {org_name or '(missing)'}")
     print(f"  Project      : {project_name or '(missing)'}")
+    if ACTIVE_PROFILE:
+        print(f"  Profile      : {ACTIVE_PROFILE} (from {ACTIVE_PROFILE_SOURCE})")
     if current_branch:
         print(f"  Git branch   : {current_branch}")
     if git_repo:

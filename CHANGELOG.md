@@ -4,6 +4,23 @@ All notable changes to Singularity are tracked in this file. The project intends
 
 ## [Unreleased]
 
+### Added
+
+- `draft-items`: preview a batch of child work items from a Markdown or JSON plan file and create them under one parent by exact Plan ID. Create-only, single parent, inherited area/iteration, and a fixed field set (type, title, description, tags, assigned-to); partial failure is reported per row.
+- `tree`: show a work item's parent chain and its child items (1-3 levels) with state, assignee, tags, and iteration.
+- `team-members`: list the configured team's members (or `--team <id>`), with `--json`.
+- `profiles` / `use`: named environment profiles under `~/.config/singularity/profiles/<name>.env`, selected by `SG_PROFILE` or a persisted marker and layered under real environment variables.
+- Work-item commands now accept a full Azure DevOps `_workitems/edit/<id>` URL (or a GitLab issue URL) anywhere a bare work-item id is taken.
+
+### Changed
+
+- `context` shows assignee and tags on each related item.
+- `doctor` reports the active project profile, lists available profiles when none is set, flags a pip CA-bundle configuration that points at a missing file, and rewords the git-repo line so `[OK]` no longer precedes a "could not infer" sentence.
+
+### Fixed
+
+- `pip install -e .` produced an `sg` entrypoint that crashed on every command because `pyproject.toml` `[tool.setuptools] py-modules` omitted `mutation_plans`. A packaging test now keeps that list in sync with the top-level modules.
+
 ## [0.2.0] - 2026-08-25
 
 ### Added
