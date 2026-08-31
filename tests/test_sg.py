@@ -118,6 +118,26 @@ class SgEntrypointTests(unittest.TestCase):
         self.assertEqual(exit_context.exception.code, 2)
         self.assertIn("--repo", stderr.getvalue())
 
+    def test_work_item_commands_accept_a_work_item_url_in_place_of_an_id(self):
+        captured = {}
+
+        def fake_show(args, token):
+            captured["id"] = args.id
+
+        with (
+            mock.patch.object(sg, "cmd_show", side_effect=fake_show),
+            mock.patch.object(sg, "missing_required_config", return_value=[]),
+            mock.patch.object(sg, "get_token", return_value="azure-token"),
+            mock.patch.object(
+                sys,
+                "argv",
+                ["sg", "show", "https://dev.azure.com/contoso/Widgets/_workitems/edit/321"],
+            ),
+        ):
+            sg.main()
+
+        self.assertEqual(captured["id"], 321)
+
     def test_removed_start_work_and_prepare_review_commands_are_rejected(self):
         for command in ("start-work", "prepare-review"):
             with self.subTest(command=command):

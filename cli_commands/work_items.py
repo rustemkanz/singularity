@@ -5,6 +5,7 @@ import os
 from errors import CliError
 from app_config import GITLAB_BASE_URL, ME, ORG, PROJECT, QA_EMAIL
 from mutation_plans import MutationPlan, render_plan_preview, require_approved_plan
+from work_item_ref import work_item_id_arg
 
 
 def _require_provider(factory, provider_label: str):
@@ -673,14 +674,14 @@ def register_work_item_subcommands(sub):
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
     p = sub.add_parser("show", help="Show full details of a work item")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
     p = sub.add_parser("comments", help="Show work-item comments")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
@@ -688,14 +689,14 @@ def register_work_item_subcommands(sub):
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
     p = sub.add_parser("context", help="Show full work-item context including comments and linked dev artifacts")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
     p = sub.add_parser("attachments", help="Show or download attachment and screenshot context for a work item")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--images-only", action="store_true", help="Only include image and screenshot references")
     p.add_argument("--no-download", action="store_true", help="List references without downloading image context")
     p.add_argument("--download-all", action="store_true", help="Download all attachments/links that the CLI can fetch, not just images")
@@ -704,11 +705,11 @@ def register_work_item_subcommands(sub):
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
     p = sub.add_parser("introduced-by", help="Show linked PR/commit candidates that likely introduced a bug")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
     p = sub.add_parser("triage", help="Summarize several work items and suggest grouping for PRs")
-    p.add_argument("ids", nargs="+", type=int, metavar="ID")
+    p.add_argument("ids", nargs="+", type=work_item_id_arg, metavar="ID")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
 
     p = sub.add_parser("pick-next", help="Show the next best candidate item and optionally preview its start plan")
@@ -717,7 +718,7 @@ def register_work_item_subcommands(sub):
     p.add_argument("--branch", "-b", metavar="NAME", help="Branch name to use when combined with --start")
 
     p = sub.add_parser("start", help="Preview the canonical start plan; apply it only by exact Plan ID")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
@@ -726,14 +727,14 @@ def register_work_item_subcommands(sub):
     _add_apply_plan_argument(p)
 
     p = sub.add_parser("review", help="Preview moving an item to 'In Review'; apply only by exact Plan ID")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
     _add_apply_plan_argument(p)
 
     p = sub.add_parser("testing", help="Preview moving an item to 'In Testing' and assigning it to QA")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
@@ -741,7 +742,7 @@ def register_work_item_subcommands(sub):
     _add_apply_plan_argument(p)
 
     p = sub.add_parser("handoff-to-qa", help="Alias for the plan-first testing command")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
@@ -749,7 +750,7 @@ def register_work_item_subcommands(sub):
     _add_apply_plan_argument(p)
 
     p = sub.add_parser("comment", help="Preview a work-item comment; post only by exact Plan ID")
-    p.add_argument("id", type=int)
+    p.add_argument("id", type=work_item_id_arg)
     p.add_argument("--provider", choices=("azure-devops", "gitlab"), default="azure-devops",
                    help="Work-tracking provider to use (default: azure-devops)")
     p.add_argument("--repo", metavar="REPO", help="GitLab project path or id when --provider gitlab")
