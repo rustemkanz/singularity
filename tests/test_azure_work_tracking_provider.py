@@ -156,8 +156,15 @@ class AzureDevOpsWorkTrackingProviderTests(unittest.TestCase):
                 {"identity": {}},
             ]
         }
-        with mock.patch.object(provider_module, "api", return_value=payload):
+        with (
+            mock.patch.object(provider_module, "ORG", "example-org"),
+            mock.patch.object(provider_module, "PROJECT", "Example Project"),
+            mock.patch.object(provider_module, "api", return_value=payload) as api_mock,
+        ):
             members = provider.list_team_members(team_id="team-guid")
+
+        requested_url = api_mock.call_args.args[2]
+        self.assertIn("/projects/Example%20Project/teams/team-guid/members", requested_url)
 
         self.assertEqual([m.display_name for m in members], ["Amy R", "Zoe Q"])
         self.assertTrue(members[0].is_admin)
