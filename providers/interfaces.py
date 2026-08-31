@@ -414,6 +414,24 @@ class WorkItemCommentsSnapshot:
 
 
 @dataclass(frozen=True)
+class WorkItemTreePreview:
+    """A previewed batch of child work items to create under one parent."""
+
+    provider: str
+    parent_id: int
+    parent_snapshot: dict
+    requests: list
+
+    def to_plan_payload(self) -> dict:
+        return {
+            "provider": self.provider,
+            "parentWorkItemId": self.parent_id,
+            "parentSnapshot": copy.deepcopy(self.parent_snapshot),
+            "requests": copy.deepcopy(self.requests),
+        }
+
+
+@dataclass(frozen=True)
 class WorkItemTransitionPreview:
     provider: str
     item_id: int
@@ -471,6 +489,19 @@ class WorkTrackingProvider(Protocol):
         ...
 
     def add_work_item_comment(self, *, item_id: int, text: str) -> int | None:
+        ...
+
+    def prepare_work_item_tree(
+        self,
+        *,
+        parent_id: int,
+        items: list,
+        tags: list[str] | None = None,
+        assignee: str | None = None,
+    ) -> WorkItemTreePreview:
+        ...
+
+    def apply_prepared_work_item_tree(self, preview: WorkItemTreePreview, *, on_result=None) -> list[dict]:
         ...
 
 

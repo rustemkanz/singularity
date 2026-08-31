@@ -5,6 +5,8 @@ import os
 from errors import CliError
 from app_config import GITLAB_BASE_URL, ME, ORG, PROJECT, QA_EMAIL
 from mutation_plans import MutationPlan, render_plan_preview, require_approved_plan
+import work_item_authoring
+from work_item_authoring import RECOGNIZED_TYPES
 from work_item_ref import work_item_id_arg
 
 
@@ -660,6 +662,97 @@ def cmd_comment(args, token, *, build_work_tracking_provider_func=None):
     print(f"✓ Comment added to work item {args.id} (comment id: {comment_id}).")
 
 
+def _draft_items_operation_value(operations: list[dict], path: str):
+    for operation in operations:
+        if operation.get("path") == path:
+            return operation.get("value")
+    return None
+
+
+def _render_draft_items_preview(parent_snapshot: dict, requests: list[dict]) -> str:
+    lines = [
+        f"\nParent  : [{parent_snapshot.get('id')}] "
+        f"{parent_snapshot.get('type') or '?'} - {parent_snapshot.get('title') or ''}"
+    ]
+    if parent_snapshot.get("areaPath"):
+        lines.append(f"  Area       : {parent_snapshot['areaPath']}")
+    if parent_snapshot.get("iterationPath"):
+        lines.append(f"  Iteration  : {parent_snapshot['iterationPath']}")
+    lines.append(f"\n  Will create {len(requests)} child work item(s) (inherit parent area/iteration):\n")
+    for request in requests:
+        operations = request.get("operations") or []
+        lines.append(f"  - {request.get('type')}: {request.get('title')}")
+        tags = _draft_items_operation_value(operations, "/fields/System.Tags")
+        if tags:
+            lines.append(f"      Tags     : {tags}")
+        assignee = _draft_items_operation_value(operations, "/fields/System.AssignedTo")
+        if assignee:
+            lines.append(f"      Assigned : {assignee}")
+        description_html = _draft_items_operation_value(operations, "/fields/System.Description")
+        if description_html:
+            lines.append(f"      Summary  : {work_item_authoring.html_to_summary(description_html)}")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_draft_items(args, token, *, build_work_tracking_provider_func=None, me: str | None = None):
+    specs = work_item_authoring.parse_item_specs(args.plan, default_type=args.default_type)
+    resolved_assignee = (ME if me is None else me) if args.assign == "me" else (args.assign or None)
+
+    provider = _require_provider(build_work_tracking_provider_func, "work tracking")(token)
+    tree_preview = provider.prepare_work_item_tree(
+        parent_id=args.parent,
+        items=specs,
+        tags=list(args.tag or []),
+        assignee=resolved_assignee,
+    )
+
+    mutation_plan = MutationPlan(
+        action="work-item.draft-items",
+        target={**_work_item_target(args), "parentWorkItemId": args.parent},
+        payload={
+            "parentWorkItemId": args.parent,
+            "defaultType": args.default_type,
+            "tags": list(args.tag or []),
+            "assignee": resolved_assignee,
+            "tree": tree_preview.to_plan_payload(),
+        },
+    )
+
+    if not getattr(args, "json", False):
+        print(_render_draft_items_preview(tree_preview.parent_snapshot, tree_preview.requests))
+
+    if not _preview_or_apply(args, mutation_plan):
+        return
+
+    created: list[dict] = []
+    failed: list[dict] = []
+
+    def on_result(entry: dict) -> None:
+        if entry.get("ok"):
+            created.append(entry)
+            if not getattr(args, "json", False):
+                print(f"  ✓ [{entry.get('id')}] {entry.get('title')}")
+        else:
+            failed.append(entry)
+            if not getattr(args, "json", False):
+                print(f"  ✗ {entry.get('title')}: {entry.get('error')}")
+
+    provider.apply_prepared_work_item_tree(tree_preview, on_result=on_result)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "appliedPlanId": args.apply,
+            "parentWorkItemId": args.parent,
+            "created": created,
+            "failed": failed,
+        }, indent=2))
+    else:
+        print(f"\n✓ Created {len(created)} work item(s) under {args.parent}.")
+
+    if failed:
+        raise CliError("ERROR: One or more work items were not created; see the per-row results above.")
+
+
 def register_work_item_subcommands(sub):
     p = sub.add_parser("sprint", help="Show the current sprint")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
@@ -757,6 +850,22 @@ def register_work_item_subcommands(sub):
     p.add_argument("text", help="Comment text")
     _add_apply_plan_argument(p)
 
+    p = sub.add_parser(
+        "draft-items",
+        help="Preview a batch of child work items from a plan file; create only by exact Plan ID",
+    )
+    p.add_argument("plan", metavar="PLAN_FILE", help="Markdown ('## <title>' sections) or .json plan file")
+    p.add_argument("--parent", required=True, type=work_item_id_arg, metavar="ID_OR_URL",
+                   help="Parent work item id or URL; new items are created as its children")
+    p.add_argument("--tag", action="append", default=[], metavar="TAG",
+                   help="Tag to add to every created item (repeatable)")
+    p.add_argument("--assign", metavar="IDENTITY",
+                   help="Assign every created item to this Azure DevOps identity; 'me' uses AZURE_DEVOPS_USER")
+    p.add_argument("--default-type", default="User Story", choices=RECOGNIZED_TYPES,
+                   help="Work-item type for sections without a [Type] token (default: User Story)")
+    p.add_argument("--json", action="store_true", help="Emit structured JSON output for scripting")
+    _add_apply_plan_argument(p)
+
     p = sub.add_parser("cleanup-artifacts", help="Preview closing disposable artifacts and deleting remote branches")
     p.add_argument("--provider", choices=("gitlab",), required=True,
                    help="Cleanup provider to use")
@@ -788,6 +897,7 @@ def work_item_command_handlers() -> dict[str, callable]:
         "testing": cmd_testing,
         "handoff-to-qa": cmd_handoff_to_qa,
         "comment": cmd_comment,
+        "draft-items": cmd_draft_items,
         "cleanup-artifacts": cmd_cleanup_artifacts,
     }
 

@@ -1392,6 +1392,92 @@ class WorkItemTests(unittest.TestCase):
         self.assertIn("Please add repro details.", stdout.getvalue())
         self.assertIn("Preview only", stdout.getvalue())
 
+    def _draft_items_plan_file(self) -> str:
+        handle = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
+        handle.write(
+            "# Backfill\n\n"
+            "## P1 — Wire the toggle [Bug]\n\nRepro steps here.\n\n"
+            "## Add settings page\n\nBuild it.\n"
+        )
+        handle.close()
+        self.addCleanup(lambda: os.unlink(handle.name))
+        return handle.name
+
+    def _draft_items_provider(self) -> mock.Mock:
+        from providers.interfaces import WorkItemTreePreview
+
+        provider = mock.Mock()
+        provider.prepare_work_item_tree.return_value = WorkItemTreePreview(
+            provider="azure-devops",
+            parent_id=812345,
+            parent_snapshot={"id": 812345, "title": "Feature", "type": "Feature", "areaPath": "P\\A", "iterationPath": "P\\S1"},
+            requests=[
+                {"type": "Bug", "title": "Wire the toggle", "operations": [{"op": "add", "path": "/fields/System.Title", "value": "Wire the toggle"}]},
+                {"type": "User Story", "title": "Add settings page", "operations": [{"op": "add", "path": "/fields/System.Title", "value": "Add settings page"}]},
+            ],
+        )
+        return provider
+
+    def test_cmd_draft_items_previews_tree_then_creates_on_apply(self):
+        plan_file = self._draft_items_plan_file()
+        provider = self._draft_items_provider()
+        args = argparse.Namespace(
+            plan=plan_file, parent=812345, tag=["v0.0.1"], assign=None,
+            default_type="User Story", json=False, apply=None,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_draft_items(
+                args, token="token", build_work_tracking_provider_func=lambda _t: provider,
+            )
+        preview = preview_stdout.getvalue()
+        self.assertIn("Will create 2 child work item(s)", preview)
+        self.assertIn("Bug: Wire the toggle", preview)
+        provider.apply_prepared_work_item_tree.assert_not_called()
+        approved = plan_id_from_preview(preview)
+
+        created_ids = iter([4001, 4002])
+
+        def fake_apply(preview_obj, *, on_result=None):
+            for request in preview_obj.requests:
+                on_result({"title": request["title"], "ok": True, "id": next(created_ids)})
+            return []
+
+        provider.apply_prepared_work_item_tree.side_effect = fake_apply
+        args.apply = approved
+        with contextlib.redirect_stdout(io.StringIO()) as apply_stdout:
+            work_item_commands.cmd_draft_items(
+                args, token="token", build_work_tracking_provider_func=lambda _t: provider,
+            )
+
+        self.assertIn("✓ [4001] Wire the toggle", apply_stdout.getvalue())
+        self.assertIn("Created 2 work item(s) under 812345", apply_stdout.getvalue())
+
+    def test_cmd_draft_items_raises_when_a_row_fails(self):
+        plan_file = self._draft_items_plan_file()
+        provider = self._draft_items_provider()
+        args = argparse.Namespace(
+            plan=plan_file, parent=812345, tag=[], assign=None,
+            default_type="User Story", json=False, apply=None,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as preview_stdout:
+            work_item_commands.cmd_draft_items(
+                args, token="token", build_work_tracking_provider_func=lambda _t: provider,
+            )
+        args.apply = plan_id_from_preview(preview_stdout.getvalue())
+
+        def fake_apply(preview_obj, *, on_result=None):
+            on_result({"title": "Wire the toggle", "ok": True, "id": 1})
+            on_result({"title": "Add settings page", "ok": False, "error": "HTTP 400"})
+            return []
+
+        provider.apply_prepared_work_item_tree.side_effect = fake_apply
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(CliError, "One or more work items were not created"):
+                work_item_commands.cmd_draft_items(
+                    args, token="token", build_work_tracking_provider_func=lambda _t: provider,
+                )
+
     def test_cmd_sprint_json_uses_work_tracking_provider(self):
         args = argparse.Namespace(json=True)
         provider = mock.Mock()

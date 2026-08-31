@@ -23,6 +23,7 @@ Commands:
     handoff-to-qa   Alias for testing
     create-pr       Preview a pull request; apply by exact Plan ID
     comment <id>    Preview a work-item comment; apply by exact Plan ID
+    draft-items <plan> Preview child work items from a plan file; create by exact Plan ID
     repos           List git repositories in the project
     pr-analyze      Summarize a PR from a URL or repo/PR reference
     pr-files        List changed files for a PR
@@ -244,6 +245,15 @@ def cmd_comment(args, token):
         args,
         token,
         build_work_tracking_provider_func=lambda token_value: build_work_tracking_provider_for_args(token_value, args),
+    )
+
+
+def cmd_draft_items(args, token):
+    return work_item_commands.cmd_draft_items(
+        args,
+        token,
+        build_work_tracking_provider_func=build_work_tracking_provider,
+        me=ME,
     )
 
 
@@ -687,6 +697,8 @@ def required_config_for_command(command: str, args) -> tuple[str, ...]:
         required = []
     if command in {"testing", "handoff-to-qa"} and not getattr(args, "qa", None):
         required.append("AZURE_DEVOPS_QA_USER")
+    if command == "draft-items" and getattr(args, "assign", None) == "me":
+        required.append("AZURE_DEVOPS_USER")
     return tuple(dict.fromkeys(required))
 
 
@@ -741,6 +753,7 @@ def main():
         "handoff-to-qa": cmd_handoff_to_qa,
         "create-pr":   cmd_create_pr,
         "comment":     cmd_comment,
+        "draft-items": cmd_draft_items,
         "cleanup-artifacts": cmd_cleanup_artifacts,
         "repos":       cmd_repos,
         "pr-analyze":  cmd_pr_analyze,

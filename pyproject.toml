@@ -38,5 +38,5 @@ Changelog = "https://github.com/rustemkanz/singularity/blob/main/CHANGELOG.md"
 sg = "sg:main"
 
 [tool.setuptools]
-py-modules = ["sg", "app_config", "errors", "git_client", "mutation_plans", "work_item_ref", "workflow_models"]
+py-modules = ["sg", "app_config", "errors", "git_client", "mutation_plans", "work_item_authoring", "work_item_ref", "workflow_models"]
 packages = ["cli_commands", "providers", "providers.azure_devops", "providers.gitlab"]
