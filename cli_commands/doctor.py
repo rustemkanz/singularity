@@ -1,5 +1,9 @@
 import json
+import os
+import re
 import shutil
+import subprocess
+import sys
 
 from app_config import (
     ACTIVE_PROFILE,
@@ -18,6 +22,33 @@ from profiles import list_profiles, profiles_dir
 from providers.azure_devops.auth import probe_azure_token
 
 
+_PIP_CERT_RE = re.compile(r"^(?:global|install)\.cert\s*=\s*(.+?)\s*$", re.MULTILINE)
+
+
+def broken_pip_cert_paths(runner=None) -> list[str]:
+    """Return configured pip cert files that do not exist (blocks 'pip install')."""
+    run = runner or (
+        lambda: subprocess.run(
+            [sys.executable, "-m", "pip", "config", "list"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    )
+    try:
+        result = run()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if getattr(result, "returncode", 1) != 0:
+        return []
+    missing: list[str] = []
+    for raw_path in _PIP_CERT_RE.findall(result.stdout or ""):
+        cert_path = raw_path.strip().strip("'\"")
+        if cert_path and not os.path.isfile(os.path.expanduser(cert_path)) and cert_path not in missing:
+            missing.append(cert_path)
+    return missing
+
+
 def cmd_doctor(
     args,
     _token=None,
@@ -28,6 +59,7 @@ def cmd_doctor(
     missing_required_config_func=None,
     list_repositories_func=None,
     match_repository_func=None,
+    broken_pip_cert_paths_func=None,
     org: str | None = None,
     project: str | None = None,
     team_id: str | None = None,
@@ -164,6 +196,21 @@ def cmd_doctor(
                 "detail": "No default Azure DevOps repository context is selected.",
                 "hints": ["Run repo-aware commands from a target work repo, pass --repo, or set AZURE_DEVOPS_DEFAULT_REPO."],
             })
+
+    broken_pip_certs = (broken_pip_cert_paths_func or broken_pip_cert_paths)()
+    if broken_pip_certs:
+        checks.append({
+            "name": "pipConfig",
+            "ok": False,
+            "detail": (
+                "pip is configured with a CA bundle that does not exist: "
+                f"{', '.join(broken_pip_certs)}. 'pip install' fails before it starts."
+            ),
+            "hints": [
+                "Fix or unset global.cert / install.cert (pip config unset global.cert), "
+                "or install with 'pip install --cert <valid-bundle> --no-build-isolation'.",
+            ],
+        })
 
     available_profiles = list_profiles()
     if not ACTIVE_PROFILE and available_profiles:

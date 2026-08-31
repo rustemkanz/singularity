@@ -17,6 +17,7 @@ def _run_doctor_json(**overrides):
         infer_git_repository_ref_func=lambda: "sample-repo",
         current_git_branch_func=lambda: "main",
         missing_required_config_func=lambda: [],
+        broken_pip_cert_paths_func=lambda: [],
         org="example-org",
         project="Example Project",
         team_id="team-1",
@@ -46,6 +47,7 @@ class DoctorCommandTests(unittest.TestCase):
                 team_id="team-1",
                 me="me@example.com",
                 default_repo=None,
+                broken_pip_cert_paths_func=lambda: [],
                 cli_error_cls=CliError,
             )
 
@@ -79,6 +81,7 @@ class DoctorCommandTests(unittest.TestCase):
                 team_id="team-1",
                 me="me@example.com",
                 default_repo="sample-repo",
+                broken_pip_cert_paths_func=lambda: [],
                 cli_error_cls=CliError,
             )
 
@@ -111,6 +114,7 @@ class DoctorCommandTests(unittest.TestCase):
                 team_id=None,
                 me=None,
                 default_repo=None,
+                broken_pip_cert_paths_func=lambda: [],
                 cli_error_cls=CliError,
             )
 
@@ -127,6 +131,24 @@ class DoctorCommandTests(unittest.TestCase):
         self.assertEqual(rendered["activeProfile"], "web-eu")
         profile_check = next(check for check in rendered["checks"] if check["name"] == "profile")
         self.assertIn("web-eu", profile_check["detail"])
+
+    def test_cmd_doctor_flags_a_broken_pip_cert(self):
+        rendered = _run_doctor_json(broken_pip_cert_paths_func=lambda: ["/no/such/bundle.pem"])
+        pip_check = next(check for check in rendered["checks"] if check["name"] == "pipConfig")
+        self.assertFalse(pip_check["ok"])
+        self.assertIn("/no/such/bundle.pem", pip_check["detail"])
+
+    def test_cmd_doctor_omits_pip_check_when_cert_config_is_fine(self):
+        rendered = _run_doctor_json(broken_pip_cert_paths_func=lambda: [])
+        self.assertIsNone(next((c for c in rendered["checks"] if c["name"] == "pipConfig"), None))
+
+    def test_broken_pip_cert_paths_parses_pip_config_output(self):
+        class Result:
+            returncode = 0
+            stdout = "global.cert='/missing/one.pem'\ninstall.cert=/etc/ssl/cert.pem\n"
+
+        missing = doctor_commands.broken_pip_cert_paths(runner=lambda: Result())
+        self.assertEqual(missing, ["/missing/one.pem"])
 
     def test_cmd_doctor_git_repo_line_is_not_a_contradiction_when_unlinked(self):
         rendered = _run_doctor_json(infer_git_repository_ref_func=lambda: None)
